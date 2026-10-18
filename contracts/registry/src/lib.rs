@@ -12,6 +12,8 @@ pub enum DataKey {
     // Per-user storage
     UserProfile(Address),
     Username(String),
+    /// Ledger timestamp of the user's last successful change_username (#359).
+    LastRename(Address),
     // Global storage
     /// Bounded leaderboard (#332): `Vec<(Address, u64)>` of at most
     /// `LEADERBOARD_SIZE` entries, sorted by points descending. Ties: the user
@@ -58,6 +60,8 @@ pub enum RegistryError {
     NotInitialized = 6,
     /// The registered-user counter has reached `u32::MAX`.
     Overflow = 7,
+    /// change_username was called again before the 30-day cooldown elapsed (#359).
+    RenameCooldown = 8,
 }
 
 const LEDGER_BUMP: u32 = 120960;
@@ -65,6 +69,9 @@ const LEDGER_THRESHOLD: u32 = 103680;
 
 /// Maximum number of users tracked by the leaderboard (#332).
 pub const LEADERBOARD_SIZE: u32 = 100;
+
+/// Minimum time between two username changes for the same user: 30 days (#359).
+pub const RENAME_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[contract]
 pub struct RegistryContract;
@@ -175,8 +182,87 @@ impl RegistryContract {
         Ok(())
     }
 
-    pub fn is_registered(env: Env, user: Address) -> bool {
-        env.storage().persistent().has(&DataKey::UserProfile(user))
+    /// Changes the caller's username (#359). In one call the old name is released
+    /// and the new name is claimed, so a name cannot be lost or double-held.
+    /// Renaming is limited to once per RENAME_COOLDOWN_SECS. Renaming to the
+    /// current name is a no-op and does not start a cooldown. Emits enamed
+    /// with (old_name, new_name).
+    pub fn change_username(env: Env, user: Address, new_name: String) -> Result<(), RegistryError> {
+        user.require_auth();
+
+        let mut profile: UserProfile = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserProfile(user.clone()))
+            .ok_or(RegistryError::NotRegistered)?;
+
+        // Same length rule as register.
+        if new_name.is_empty() || new_name.len() > 32 {
+            return Err(RegistryError::UsernameTaken);
+        }
+        if new_name == profile.username {
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+        if let Some(last) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::LastRename(user.clone()))
+        {
+            if now < last.saturating_add(RENAME_COOLDOWN_SECS) {
+                return Err(RegistryError::RenameCooldown);
+            }
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Username(new_name.clone()))
+        {
+            return Err(RegistryError::UsernameTaken);
+        }
+
+        let old_name = profile.username.clone();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Username(old_name.clone()));
+        env.storage()
+            .persistent()
+            .set(&DataKey::Username(new_name.clone()), &user);
+
+        profile.username = new_name.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserProfile(user.clone()), &profile);
+        env.storage()
+            .persistent()
+            .set(&DataKey::LastRename(user.clone()), &now);
+
+        env.storage().persistent().extend_ttl(
+            &DataKey::UserProfile(user.clone()),
+            LEDGER_THRESHOLD,
+            LEDGER_BUMP,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::Username(new_name.clone()),
+            LEDGER_THRESHOLD,
+            LEDGER_BUMP,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::LastRename(user.clone()),
+            LEDGER_THRESHOLD,
+            LEDGER_BUMP,
+        );
+
+        env.events().publish(
+            (symbol_short!("renamed"), user),
+            (old_name, new_name),
+        );
+        Ok(())
+    }
+
+    pub fn is_registered(env: Env, user: Address) -> bool {        env.storage().persistent().has(&DataKey::UserProfile(user))
     }
 
     pub fn get_user(env: Env, user: Address) -> Result<UserProfile, RegistryError> {
@@ -1010,6 +1096,91 @@ mod test {
     // ── is_registered edge cases (#91) ──────────────────────────────────────
 
     // #91: Unregistered address returns false
+    // #359: change_username frees the old name for someone else.
+    #[test]
+    fn test_change_username_frees_old_name() {
+        let (env, _admin, client) = setup();
+        let first = Address::generate(&env);
+        let second = Address::generate(&env);
+        client.register(&first, &String::from_str(&env, "typo"));
+        client.change_username(&first, &String::from_str(&env, "fixed"));
+
+        assert_eq!(client.get_user(&first).username, String::from_str(&env, "fixed"));
+        client.register(&second, &String::from_str(&env, "typo"));
+        assert_eq!(client.get_user(&second).username, String::from_str(&env, "typo"));
+    }
+
+    // #359: a name still held by someone else cannot be taken, and the caller
+    // keeps the old name.
+    #[test]
+    fn test_change_username_rejects_taken_name() {
+        let (env, _admin, client) = setup();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        client.register(&alice, &String::from_str(&env, "alpha"));
+        client.register(&bob, &String::from_str(&env, "beta"));
+
+        let result = client.try_change_username(&alice, &String::from_str(&env, "beta"));
+        assert_eq!(result, Err(Ok(RegistryError::UsernameTaken)));
+        assert_eq!(client.get_user(&alice).username, String::from_str(&env, "alpha"));
+        assert_eq!(client.get_user(&bob).username, String::from_str(&env, "beta"));
+    }
+
+    // #359: a second rename inside the cooldown fails; after the cooldown it succeeds.
+    #[test]
+    fn test_second_rename_inside_cooldown_fails() {
+        let (env, _admin, client) = setup();
+        let user = Address::generate(&env);
+        env.ledger().with_mut(|li| li.timestamp = 1_000);
+        client.register(&user, &String::from_str(&env, "first"));
+
+        client.change_username(&user, &String::from_str(&env, "second"));
+
+        env.ledger()
+            .with_mut(|li| li.timestamp = 1_000 + RENAME_COOLDOWN_SECS - 1);
+        let early = client.try_change_username(&user, &String::from_str(&env, "third"));
+        assert_eq!(early, Err(Ok(RegistryError::RenameCooldown)));
+
+        env.ledger()
+            .with_mut(|li| li.timestamp = 1_000 + RENAME_COOLDOWN_SECS);
+        client.change_username(&user, &String::from_str(&env, "third"));
+        assert_eq!(client.get_user(&user).username, String::from_str(&env, "third"));
+    }
+
+    #[test]
+    fn test_change_username_unregistered_returns_not_registered() {
+        let (env, _admin, client) = setup();
+        let stranger = Address::generate(&env);
+        let result = client.try_change_username(&stranger, &String::from_str(&env, "ghost"));
+        assert_eq!(result, Err(Ok(RegistryError::NotRegistered)));
+    }
+
+    #[test]
+    fn test_change_username_rejects_invalid_length() {
+        let (env, _admin, client) = setup();
+        let user = Address::generate(&env);
+        client.register(&user, &String::from_str(&env, "valid"));
+        let empty = client.try_change_username(&user, &String::from_str(&env, ""));
+        assert_eq!(empty, Err(Ok(RegistryError::UsernameTaken)));
+        let long = String::from_str(&env, "thisistoolongusernamethatexceedsthelimit");
+        assert_eq!(
+            client.try_change_username(&user, &long),
+            Err(Ok(RegistryError::UsernameTaken))
+        );
+    }
+
+    #[test]
+    fn test_change_username_emits_renamed_event() {
+        let (env, _admin, client) = setup();
+        let user = Address::generate(&env);
+        client.register(&user, &String::from_str(&env, "before"));
+        let before = env.events().all().len();
+
+        client.change_username(&user, &String::from_str(&env, "after"));
+
+        assert!(env.events().all().len() > before, "renamed event expected");
+    }
+
     #[test]
     fn test_is_registered_returns_false_for_unregistered() {
         let (env, _admin, client) = setup();
