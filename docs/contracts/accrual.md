@@ -16,7 +16,7 @@ pub fn initialize(
 ) -> Result<(), AccrualError>
 ```
 
-Initialize the contract with an admin address, the bot_nft and registry addresses, and the points-to-AMT conversion rate. Requires authorization from `admin`. The registry address is stored so `start_accrual` can verify registration up front (#415).
+Initialize the contract with an admin address, the bot_nft and registry addresses, and the points-to-AMT conversion rate. Requires authorization from `admin`. The registry address is stored so `start_accrual` can verify registration up front (#415). Initialization also wires this contract into bot_nft via `set_accrual`; a failure aborts initialization with `BotNftCallFailed`.
 
 - `admin`: The contract administrator address.
 - `bot_nft`: The bot NFT contract used to derive each user's accrual rate.
@@ -26,6 +26,7 @@ Initialize the contract with an admin address, the bot_nft and registry addresse
 Errors:
 - `AlreadyInitialized`: The contract has already been initialized.
 - `InvalidConfig`: `points_per_amt` is `0`.
+- `BotNftCallFailed`: bot_nft rejected or could not complete the accrual wiring call.
 
 Example:
 
@@ -158,6 +159,20 @@ Example:
 ```rust
 let admin = accrual_client.admin();
 ```
+
+---
+
+### accept_token_admin
+
+```rust
+pub fn accept_token_admin(env: Env) -> Result<(), AccrualError>
+```
+
+Accept the pending AMT Token admin nomination for this Accrual contract. Requires
+authorization from the Accrual admin. The Accrual contract authorizes the
+Token's `accept_admin` call as itself, allowing token administration to move to
+a contract address without exposing a general-purpose forwarding entry point.
+After acceptance, AMT claims can mint through Accrual.
 
 ---
 

@@ -14,6 +14,8 @@ import { pollWhenVisible } from "@/lib/polling";
 import { STALE_TIME, GC_TIME, qk } from "@/lib/queryKeys";
 import { trackStatus, newTxId } from "@/components/ui/TxStatus";
 import type { DashboardData } from "./useAccrual";
+import { toastContractError } from "@/lib/errors";
+export { useProfiles } from "./useProfiles";
 
 export function useBuyBot() {
   const queryClient = useQueryClient();
@@ -65,9 +67,6 @@ export function useBuyBot() {
                 resolve(status);
                 break;
               case "error":
-                toast.error(`Purchase failed: ${status.error || "Unknown error"}`, {
-                  id: "buy_bot",
-                });
                 reject(new Error(status.error || "Purchase failed"));
                 break;
             }
@@ -96,7 +95,7 @@ export function useBuyBot() {
         queryClient.setQueryData(qk.listings(), context.previousListings);
         queryClient.setQueryData(qk.myListings(publicKey), context.previousMyListings);
       }
-      // onStatus callback already handles error toasts
+      toastContractError(error, "marketplace");
       console.error("Bot purchase failed:", error);
     },
     onSettled: () => {
@@ -160,9 +159,6 @@ export function useMintTierBot() {
                 resolve(status);
                 break;
               case "error":
-                toast.error(`Mint failed: ${status.error || "Unknown error"}`, {
-                  id: "mint_tier",
-                });
                 reject(new Error(status.error || "Mint failed"));
                 break;
             }
@@ -176,7 +172,7 @@ export function useMintTierBot() {
       queryClient.invalidateQueries({ queryKey: qk.accrualState(publicKey) });
     },
     onError: (error: Error) => {
-      // onStatus callback already handles error toasts
+      toastContractError(error, "botNft");
       console.error("Bot mint failed:", error);
     },
   });
@@ -271,9 +267,6 @@ export function useListBot() {
                 resolve(status);
                 break;
               case "error":
-                toast.error(`Listing failed: ${status.error || "Unknown error"}`, {
-                  id: "list_bot",
-                });
                 reject(new Error(status.error || "Listing failed"));
                 break;
             }
@@ -306,7 +299,7 @@ export function useListBot() {
         queryClient.setQueryData(qk.bots(publicKey), context.previousBots);
         queryClient.setQueryData(qk.dashboard(publicKey), context.previousDashboard);
       }
-      // onStatus callback already handles error toasts
+      toastContractError(error, "marketplace");
       console.error("Bot listing failed:", error);
     },
     onSettled: () => {
@@ -370,9 +363,6 @@ export function useCancelListing() {
                 resolve(status);
                 break;
               case "error":
-                toast.error(`Cancellation failed: ${status.error || "Unknown error"}`, {
-                  id: "cancel_listing",
-                });
                 reject(new Error(status.error || "Cancellation failed"));
                 break;
             }
@@ -401,7 +391,7 @@ export function useCancelListing() {
         queryClient.setQueryData(qk.listings(), context.previousListings);
         queryClient.setQueryData(qk.myListings(publicKey), context.previousMyListings);
       }
-      // onStatus callback already handles error toasts
+      toastContractError(error, "marketplace");
       console.error("Listing cancellation failed:", error);
     },
     onSettled: () => {

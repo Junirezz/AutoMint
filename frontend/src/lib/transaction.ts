@@ -1,20 +1,14 @@
-import {
-  Contract,
-  TransactionBuilder,
-  scValToNative,
-  xdr,
-  SorobanRpc,
-} from "@stellar/stellar-sdk";
+import { Contract, TransactionBuilder, scValToNative, xdr, SorobanRpc } from "@stellar/stellar-sdk";
 import {
   BASE_FEE,
-  HORIZON_URL,
   POLL_INTERVAL_MS,
-  SOROBAN_RPC_URL,
-  SOROBAN_RPC_URLS,
   STELLAR_NETWORK_PASSPHRASE,
   TX_TIMEOUT,
+  TX_POLL_TIMEOUT_MS,
 } from "./constants";
+import { getExplorerUrl } from "./explorer";
 import {
+  applyFeeMultiplier,
   rpcCall,
   getServer,
   signTx,
@@ -23,15 +17,32 @@ import {
   TxTimeoutError,
   UserRejectedError,
 } from "./stellar";
-import { withRetry } from "./rpcRetry";
 import { useTxStore, type TxRecord } from "@/store/txStore";
+import { useWalletStore } from "@/store/walletStore";
+
+/**
+ * Validate and get the fee multiplier from environment.
+ * Must be a positive finite number; defaults to 1.0 if not set.
+ */
+function getFeeMultiplier(): number {
+  const rawValue = process.env.NEXT_PUBLIC_FEE_MULTIPLIER;
+  if (!rawValue) return 1.0;
+
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(
+      `Invalid NEXT_PUBLIC_FEE_MULTIPLIER: "${rawValue}". Must be a positive finite number.`
+    );
+  }
+  return parsed;
+}
 
 /**
  * Multiplier applied to the assembled resource fee to add a safety buffer.
  * Configurable via NEXT_PUBLIC_FEE_MULTIPLIER env var (default 1.0).
  * Applied AFTER server.prepareTransaction assembles the resource fee.
  */
-const FEE_MULTIPLIER = Number(process.env.NEXT_PUBLIC_FEE_MULTIPLIER) || 1.0;
+const FEE_MULTIPLIER = getFeeMultiplier();
 
 /**
  * Transaction execution stage for status callbacks.
@@ -68,29 +79,25 @@ export interface ExecuteTransactionParams {
 }
 
 /**
- * Per-account sequence tracking state.
+ * Per-account transaction queue state.
  */
 interface SequenceState {
-  current: number;
-  pending: number;
   queue: (() => Promise<unknown>)[];
   processing: boolean;
 }
 
 /**
- * Module-level tracking of pending sequence numbers per account address.
+ * Module-level transaction queues per account address.
  * Used to serialize transaction submissions and avoid bad sequence errors.
  */
 const sequenceState = new Map<string, SequenceState>();
 
 /**
- * Get or initialize the sequence state for an account.
+ * Get or initialize the transaction queue for an account.
  */
 function getSequenceState(address: string): SequenceState {
   if (!sequenceState.has(address)) {
     sequenceState.set(address, {
-      current: 0,
-      pending: 0,
       queue: [],
       processing: false,
     });
@@ -141,7 +148,7 @@ export function summarizeArgs(args: xdr.ScVal[]): string {
         const text =
           typeof native === "object" && native !== null
             ? JSON.stringify(native, (_key, value) =>
-                typeof value === "bigint" ? value.toString() : value
+                typeof value === "bigint" ? value.toString() : value,
               )
             : String(native);
         // Keeps both ends of long values (addresses, contract IDs) recognisable.
@@ -151,13 +158,6 @@ export function summarizeArgs(args: xdr.ScVal[]): string {
       }
     })
     .join(", ");
-}
-
-/**
- * Build explorer URL from transaction hash.
- */
-function buildExplorerUrl(hash: string): string {
-  return `${HORIZON_URL}/transactions/${hash}`;
 }
 
 /**
@@ -172,16 +172,18 @@ function buildExplorerUrl(hash: string): string {
  */
 async function submitTxWithHash(
   signedXdr: string,
-  onAccepted?: (hash: string) => void
+  onAccepted?: (hash: string) => void,
 ): Promise<{ hash: string; result: unknown }> {
   const server = getServer();
 
   // Rebuild to validate the XDR
   let txToSend: unknown = signedXdr;
   try {
-    const maybeFromXdr = (TransactionBuilder as unknown as {
-      fromXDR?: (xdr: string, passphrase: string) => unknown;
-    }).fromXDR;
+    const maybeFromXdr = (
+      TransactionBuilder as unknown as {
+        fromXDR?: (xdr: string, passphrase: string) => unknown;
+      }
+    ).fromXDR;
     if (typeof maybeFromXdr === "function") {
       txToSend = maybeFromXdr.call(TransactionBuilder, signedXdr, STELLAR_NETWORK_PASSPHRASE);
     } else {
@@ -193,7 +195,7 @@ async function submitTxWithHash(
         try {
           txToSend = new (TxClass as new (x: string, p: string) => unknown)(
             signedXdr,
-            STELLAR_NETWORK_PASSPHRASE
+            STELLAR_NETWORK_PASSPHRASE,
           );
         } catch {
           txToSend = signedXdr;
@@ -206,9 +208,11 @@ async function submitTxWithHash(
 
   let sendRes: SorobanRpc.Api.SendTransactionResponse;
   try {
-    sendRes = await (server as unknown as {
-      sendTransaction: (tx: unknown) => Promise<SorobanRpc.Api.SendTransactionResponse>;
-    }).sendTransaction(txToSend as never);
+    sendRes = await (
+      server as unknown as {
+        sendTransaction: (tx: unknown) => Promise<SorobanRpc.Api.SendTransactionResponse>;
+      }
+    ).sendTransaction(txToSend as never);
   } catch (err) {
     throw err instanceof Error ? err : new Error(String(err));
   }
@@ -217,7 +221,7 @@ async function submitTxWithHash(
     const r = sendRes as unknown as { errorResultXdr?: string; status: string };
     throw new TxSendFailedError(
       `Transaction submission failed: ${r.errorResultXdr ?? r.status}`,
-      r.errorResultXdr
+      r.errorResultXdr,
     );
   }
 
@@ -245,9 +249,9 @@ async function submitTxWithHash(
  */
 async function pollSubmitted(
   server: SorobanRpc.Server,
-  hash: string
+  hash: string,
 ): Promise<{ hash: string; result: unknown }> {
-  const timeoutMs = (TX_TIMEOUT + 30) * 1000;
+  const timeoutMs = TX_POLL_TIMEOUT_MS;
   const start = Date.now();
   let delayMs = 1000;
   const maxDelayMs = 8000;
@@ -293,10 +297,7 @@ async function pollSubmitted(
       useTxStore
         .getState()
         .resolveTransaction(hash, "failed", typeof diag === "string" ? diag : undefined);
-      throw new TxFailedError(
-        `Transaction failed on-chain: ${diag ?? "unknown"}`,
-        diag
-      );
+      throw new TxFailedError(`Transaction failed on-chain: ${diag ?? "unknown"}`, diag);
     }
 
     await new Promise((r) => setTimeout(r, delayMs));
@@ -317,7 +318,7 @@ async function pollSubmitted(
  * - Submitting to RPC
  * - Polling for confirmation (with timeout)
  * - Decoding and returning the contract return value
- * - Sequence number management (incremented before each submission, reconciled after)
+ * - Per-account serialization with fresh account state for every build
  * - Automatic retry on BAD_SEQ with refreshed account state
  *
  * @param params execution parameters including contract, method, args, and address
@@ -327,16 +328,12 @@ async function pollSubmitted(
  * @throws TxFailedError when the transaction fails on-chain
  * @throws Error for simulation, build, or other failures
  */
-export async function executeTransaction(
-  params: ExecuteTransactionParams
-): Promise<unknown> {
-  const {
-    contractId,
-    method,
-    args,
-    sourceAddress,
-    onStatus,
-  } = params;
+export async function executeTransaction(params: ExecuteTransactionParams): Promise<unknown> {
+  const { contractId, method, args, sourceAddress, onStatus } = params;
+
+  if (useWalletStore.getState().networkMismatch) {
+    throw new Error("Wrong network: switch Freighter to the configured Stellar network.");
+  }
 
   const state = getSequenceState(sourceAddress);
 
@@ -349,7 +346,6 @@ export async function executeTransaction(
           args,
           sourceAddress,
           onStatus,
-          state
         );
         resolve(result);
       } catch (error) {
@@ -363,7 +359,7 @@ export async function executeTransaction(
 }
 
 /**
- * Internal transaction execution with sequence management.
+ * Internal transaction execution using the network's current account sequence.
  */
 async function executeTransactionInternal(
   contractId: string,
@@ -371,17 +367,11 @@ async function executeTransactionInternal(
   args: xdr.ScVal[],
   sourceAddress: string,
   onStatus: ((status: TransactionStatus) => void) | undefined,
-  sequenceState: SequenceState
 ): Promise<unknown> {
   onStatus?.({ stage: "building" });
 
   const contract = new Contract(contractId);
   const account = await rpcCall((server) => server.getAccount(sourceAddress));
-
-  // Initialize sequence tracking on first transaction for this account
-  if (sequenceState.current === 0) {
-    sequenceState.current = Number(account.sequenceNumber());
-  }
 
   const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
@@ -393,9 +383,7 @@ async function executeTransactionInternal(
 
   onStatus?.({ stage: "simulating" });
 
-  const simResult = await rpcCall((server) =>
-    withRetry(() => server.simulateTransaction(tx))
-  );
+  const simResult = await rpcCall((server) => server.simulateTransaction(tx));
 
   if (SorobanRpc.Api.isSimulationError(simResult)) {
     const errorMsg = `Simulation failed for ${method}: ${simResult.error}`;
@@ -408,14 +396,11 @@ async function executeTransactionInternal(
 
   onStatus?.({ stage: "assembling" });
 
-  const assembled = SorobanRpc.assembleTransaction(tx, simResult).build();
-
   // Apply fee multiplier to assembled resource fee for surge buffer
-  if (FEE_MULTIPLIER !== 1.0) {
-    const baseFeeNum = parseInt(assembled.fee, 10);
-    const multipliedFee = Math.ceil(baseFeeNum * FEE_MULTIPLIER).toString();
-    assembled.fee = multipliedFee;
-  }
+  const assembled = applyFeeMultiplier(
+    SorobanRpc.assembleTransaction(tx, simResult).build(),
+    FEE_MULTIPLIER,
+  );
 
   const xdr = assembled.toXDR();
 
@@ -436,9 +421,6 @@ async function executeTransactionInternal(
 
   onStatus?.({ stage: "submitting" });
 
-  // Increment pending sequence for this submission
-  sequenceState.pending = sequenceState.current + 1;
-
   // Once the network has accepted the transaction: persist it to the history
   // (so a tab closed mid-confirmation is resolved on the next load) and report
   // that confirmation has begun.
@@ -455,27 +437,17 @@ async function executeTransactionInternal(
   try {
     const { hash, result } = await submitTxWithHash(signedXdr, onAccepted);
 
-    // Increment current sequence on successful submission
-    sequenceState.current = sequenceState.pending;
-
-    const explorerUrl = buildExplorerUrl(hash);
-    onStatus?.({ stage: "success", hash, explorerUrl });
+    const explorerUrl = getExplorerUrl(hash);
+    onStatus?.({ stage: "success", hash, ...(explorerUrl ? { explorerUrl } : {}) });
 
     return result;
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    
+
     // Check if this is a BAD_SEQ error
-    if (
-      error instanceof TxSendFailedError &&
-      errorMsg.includes("BAD_SEQ")
-    ) {
+    if (error instanceof TxSendFailedError && errorMsg.includes("BAD_SEQ")) {
       // Retry once with refreshed account state
-      const refreshedAccount = await rpcCall((server) =>
-        server.getAccount(sourceAddress)
-      );
-      sequenceState.current = Number(refreshedAccount.sequenceNumber());
-      sequenceState.pending = sequenceState.current + 1;
+      const refreshedAccount = await rpcCall((server) => server.getAccount(sourceAddress));
 
       onStatus?.({ stage: "building" });
 
@@ -490,9 +462,7 @@ async function executeTransactionInternal(
 
       onStatus?.({ stage: "simulating" });
 
-      const retrySimResult = await rpcCall((server) =>
-        withRetry(() => server.simulateTransaction(retryTx))
-      );
+      const retrySimResult = await rpcCall((server) => server.simulateTransaction(retryTx));
 
       if (SorobanRpc.Api.isSimulationError(retrySimResult)) {
         const retryError = `Simulation failed on retry for ${method}: ${retrySimResult.error}`;
@@ -502,19 +472,13 @@ async function executeTransactionInternal(
 
       onStatus?.({ stage: "assembling" });
 
-      const retryAssembled = SorobanRpc.assembleTransaction(
-        retryTx,
-        retrySimResult
-      ).build();
-
-      if (FEE_MULTIPLIER !== 1.0) {
-        const baseFeeNum = parseInt(retryAssembled.fee, 10);
-        const multipliedFee = Math.ceil(baseFeeNum * FEE_MULTIPLIER).toString();
-        retryAssembled.fee = multipliedFee;
-      }
+      const retryAssembled = applyFeeMultiplier(
+        SorobanRpc.assembleTransaction(retryTx, retrySimResult).build(),
+        FEE_MULTIPLIER,
+      );
 
       const retryXdr = retryAssembled.toXDR();
-      
+
       onStatus?.({ stage: "signing" });
       const retrySignedXdr = await signTx(retryXdr, sourceAddress);
 
@@ -522,13 +486,11 @@ async function executeTransactionInternal(
 
       const { hash: retryHash, result: retryResult } = await submitTxWithHash(
         retrySignedXdr,
-        onAccepted
+        onAccepted,
       );
 
-      sequenceState.current = sequenceState.pending;
-
-      const explorerUrl = buildExplorerUrl(retryHash);
-      onStatus?.({ stage: "success", hash: retryHash, explorerUrl });
+      const explorerUrl = getExplorerUrl(retryHash);
+      onStatus?.({ stage: "success", hash: retryHash, ...(explorerUrl ? { explorerUrl } : {}) });
 
       return retryResult;
     }
@@ -538,13 +500,12 @@ async function executeTransactionInternal(
   }
 }
 
-
 /**
  * Interpret one `getTransaction` response: a final outcome for SUCCESS /
  * FAILED, `null` while the transaction is still unresolved (NOT_FOUND).
  */
 function toResumeOutcome(
-  result: SorobanRpc.Api.GetTransactionResponse
+  result: SorobanRpc.Api.GetTransactionResponse,
 ): { status: "success" } | { status: "failed"; error: string } | null {
   const status = (result as unknown as { status: string }).status;
   if (status === "SUCCESS") return { status: "success" };
@@ -570,7 +531,7 @@ function toResumeOutcome(
  */
 async function resumeOne(record: TxRecord): Promise<void> {
   const { resolveTransaction } = useTxStore.getState();
-  const maxWaitMs = (TX_TIMEOUT + 10) * 1000; // matches the live-poll window
+  const maxWaitMs = TX_POLL_TIMEOUT_MS;
   const expiresAt = record.timestamp + maxWaitMs;
   const startTime = Date.now();
 
@@ -579,7 +540,7 @@ async function resumeOne(record: TxRecord): Promise<void> {
     try {
       // getTransaction is idempotent, so it gets retry + endpoint failover.
       const outcome = toResumeOutcome(
-        await rpcCall((server) => server.getTransaction(record.hash))
+        await rpcCall((server) => server.getTransaction(record.hash)),
       );
       if (outcome?.status === "success") {
         resolveTransaction(record.hash, "success");
@@ -621,7 +582,7 @@ export async function resumePendingTransactions(): Promise<void> {
       } finally {
         polling.delete(record.hash);
       }
-    })
+    }),
   );
 }
 

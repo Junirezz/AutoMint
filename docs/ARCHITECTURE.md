@@ -156,6 +156,7 @@ The table below specifies the required authentication signer, verification mecha
 | | `get_accrual_states` | None | Public view | Accrual states for up to 50 users in one call (`None` for unknown users) |
 | | `settle` | Anyone | None (permissionless) | Credits pending points to the registry for up to 25 users without minting; the user still calls `claim` to mint |
 | | `claim` | User | `user.require_auth()` | Claims pending points & triggers mint if >= 100 |
+| | `accept_token_admin` | Accrual admin | `admin.require_auth()`; Accrual contract auth to Token | Accepts the Token admin nomination so accrual claims can mint |
 | | `config` | None | Public view | Returns contract configuration |
 | | `admin` | None | Public view | Returns contract admin address |
 | **Marketplace**| `initialize` | Admin | `admin.require_auth()` | Sets admin, BotNFT address, and fee bps (250) |
@@ -169,9 +170,10 @@ The table below specifies the required authentication signer, verification mecha
 | | `propose_admin` / `accept_admin` | Admin / New admin | `require_auth()` | Two-step admin transfer |
 | | `pause` / `unpause` | Admin | `admin.require_auth()` | Blocks/resumes `list_bot`, `buy_bot`, `update_price`; `cancel_listing` always works |
 | | `tier_stats` / `market_stats` | None | Public view | Per-tier volume, sale count, last sale price and floor |
-| | `make_offer` | Buyer | `buyer.require_auth()` | Escrows the offered amount in the contract; rejected on the buyer's own bot |
+| | `make_offer` | Buyer | `buyer.require_auth()` | Escrows the offered amount in the contract; rejected on the buyer's own bot or when `expires_at` is more than `MAX_OFFER_DURATION` (30 days) away |
 | | `accept_offer` | Seller | `seller.require_auth()` | Moves the bot (from the seller or from their listing escrow) to the buyer and pays out the escrow |
 | | `cancel_offer` | Buyer, or anyone after expiry | `caller.require_auth()` | Refunds the escrow in full to the buyer |
+| | `dismiss_offer` | Bot owner (or listing seller), or admin | `caller.require_auth()` | Clears an open offer before expiry; refunds the escrow in full to the buyer |
 | | `get_offer` / `get_offers_for_bot` | None | Public view | One offer, or every open offer on a bot |
 | | `withdraw_fees` | Admin | `admin.require_auth()` | Moves accrued fees out; bounded by `fees_accrued`, never touches offer escrow |
 | | `fees_accrued` | None | Public view | Accrued platform fees per currency |
@@ -184,7 +186,10 @@ The table below specifies the required authentication signer, verification mecha
 | | `transfer_from` | Spender | `spender.require_auth()` | Transfers tokens using active allowance |
 | | `burn` | From | `from.require_auth()` | Burns tokens from caller balance |
 | | `mint` | Admin | `admin.require_auth()` | Mints new tokens to recipient |
-| | `set_admin` | Admin | `admin.require_auth()` | Transfers admin rights to new address |
+| | `set_admin` | Admin | `admin.require_auth()` | Proposes a new admin; transfer completes only when accepted |
+| | `accept_admin` | Pending admin | `pending_admin.require_auth()` | Accepts the proposed admin transfer |
+| | `cancel_admin_transfer` | Admin | `admin.require_auth()` | Cancels a pending admin transfer |
+| | `set_metadata` | Admin | `admin.require_auth()` | Updates name and symbol; decimals remain immutable |
 | | `admin` | None | Public view | Returns contract admin address |
 | | `decimals` | None | Public view | Returns decimal precision (7) |
 | | `name` | None | Public view | Returns token name ("AutoMint Token") |
@@ -205,13 +210,18 @@ Soroban provides three storage tiers: **Instance**, **Persistent**, and **Tempor
 #### 1. Registry Contract (`automint_registry`)
 - **Instance Storage**:
   - `Admin`: `Address`
+  - `PendingAdmin`: `Address` (two-step admin transfer, AM-031)
   - `Initialized`: `bool`
   - `TotalUsers`: `u32`
-  - `UserList`: `Vec<Address>`
+  - `TopUsers`: `Vec<(Address, u64)>` — bounded lifetime leaderboard (at most `LEADERBOARD_SIZE` entries, points descending)
+  - `SeasonTop(u32)`: `Vec<(Address, u64)>` — same bounded shape, one board per season (#371)
+  - `Season`: `u32` — current season counter; absent = season 0 (#371)
+  - `Writers`: `Writers { accrual: Address, bot_nft: Address }` — #318 cross-contract writer allowlist
 - **Persistent Storage**:
-  - `UserProfile(Address)` -> `UserProfile { address: Address, username: String, total_points: u64, claimed_amt: i128, registered_at: u64, bot_count: u32 }`
-  - `Username(String)` -> `Address`
-- **TTL Renewal Policy**: Every write operation (`register`, `add_points`, `increment_bot_count`, `decrement_bot_count`, `add_claimed_amt`) extends TTL for the target key and contract instance using `LEDGER_THRESHOLD` and `LEDGER_BUMP`.
+  - `UserProfile(Address)` -> `UserProfile { address: Address, username: String, display_name: String, total_points: u64, claimed_amt: i128, registered_at: u64, bot_count: u32 }` (`username` is the ASCII-lowercased uniqueness key; `display_name` preserves the original casing, #373)
+  - `Username(String)` -> `Address` (keyed on the ASCII-lowercased username)
+  - `SeasonPoints(u32, Address)` -> `u64` — per-user season points (#371)
+- **TTL Renewal Policy**: Every write operation (`register`, `add_points`, `increment_bot_count`, `decrement_bot_count`, `add_claimed_amt`) extends TTL for the target key (including the user's current-season `SeasonPoints` entry) and contract instance using `LEDGER_THRESHOLD` and `LEDGER_BUMP`.
 
 #### 2. BotNFT Contract (`automint_bot_nft`)
 - **Instance Storage**:
@@ -270,9 +280,17 @@ Soroban provides three storage tiers: **Instance**, **Persistent**, and **Tempor
 
 | Contract | Event Topic (Symbol) | Additional Topics | Data Payload | Trigger Condition |
 |---|---|---|---|---|
-| **Registry** | `register` | `user: Address` | `timestamp: u64` | User successfully registered |
+| **Registry** | `init` | `admin: Address` | `timestamp: u64` | Registry initialized |
+| | `register` | `user: Address` | `timestamp: u64` | User successfully registered |
+| | `writers` | *(none)* | `(accrual: Address, bot_nft: Address)` | Writer allowlist set |
 | | `addpoints` | `user: Address` | `points: u64` | Points added via claim |
+| | `inc_bot` | `user: Address` | `bot_count: u32` | User bot count incremented on mint |
 | | `dec_bot` | `user: Address` | `bot_count: u32` | User decrements bot count |
+| | `claimed` | `user: Address` | `amount: i128` | Claimed AMT total credited (`add_claimed_amt`, #370) |
+| | `newseason` | *(none)* | `season: u32` | New season started (`start_new_season`, #371) |
+| | `set_admin` | *(none)* | `(current_admin: Address, new_admin: Address)` | Admin nominated (two-step, #372) |
+| | `adm_acpt` | *(none)* | `(current_admin: Address, pending: Address)` | Nominated admin accepted (#372) |
+| | `adm_cncl` | *(none)* | `(current_admin: Address, pending: Address)` | Pending transfer cancelled (#372) |
 | **BotNFT** | `mint` | `owner: Address` | `(bot_id: u64, tier: Tier)` | Bot NFT minted |
 | | `transfer` | `from: Address`, `to: Address` | `bot_id: u64` | Bot NFT ownership transferred |
 | **Accrual** | `start` | `user: Address` | `timestamp: u64` | Accrual tracking started |
@@ -285,12 +303,15 @@ Soroban provides three storage tiers: **Instance**, **Persistent**, and **Tempor
 | | `offered` | `buyer: Address`, `offer_id: u64` | `(bot_id: u64, amount: i128, expires_at: u64)` | Offer escrowed |
 | | `offer_acc` | `seller: Address`, `buyer: Address` | `(offer_id: u64, bot_id: u64, amount: i128)` | Offer accepted; bot and funds moved |
 | | `offer_cxl` | `buyer: Address`, `offer_id: u64` | `(bot_id: u64, amount: i128, expired: bool)` | Offer cancelled and refunded |
+| | `offer_dsm` | `buyer: Address`, `offer_id: u64` | `(bot_id: u64, amount: i128, dismissed_by: Address)` | Offer dismissed by the bot owner or admin and refunded |
 | | `fees_wd` | `admin: Address`, `to: Address` | `(currency: Address, amount: i128, remaining: i128)` | Accrued fees withdrawn |
 | **AMT Token** | `approve` | `from: Address`, `spender: Address` | `(amount: i128, expiration: u32)` | Allowance approved |
 | | `transfer` | `from: Address`, `to: Address` | `amount: i128` | Tokens transferred |
 | | `burn` | `from: Address` | `amount: i128` | Tokens burned |
 | | `mint` | `to: Address` | `amount: i128` | Tokens minted |
-| | `set_admin` | `symbol_short!("set_admin")` | `new_admin: Address` | Admin transferred |
+| | `admin_proposed` | `("admin_proposed", current_admin)` | `pending_admin: Address` | Admin transfer proposed |
+| | `set_admin` | `("set_admin", old_admin)` | `new_admin: Address` | Admin transfer accepted |
+| | `metadata` | `("metadata",)` | `(old_name, old_symbol, new_name, new_symbol)` | Token metadata updated |
 
 ---
 

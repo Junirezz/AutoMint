@@ -35,23 +35,55 @@ export interface RpcClient {
     contractIds: string[];
     cursor?: string;
     limit?: number;
+    /** Aborted on shutdown: pagination and retry backoff stop early. */
+    signal?: AbortSignal;
   }): Promise<GetEventsResult>;
+  /** Oldest ledger the node still retains (`getHealth`); `getEvents` rejects older start ledgers. */
+  getOldestLedger(signal?: AbortSignal): Promise<number>;
 }
 
 const DEFAULT_MAX_RETRIES = 5;
 const DEFAULT_BASE_DELAY_MS = 250;
 const DEFAULT_MAX_DELAY_MS = 15_000;
 
-function isTransientError(error: unknown): boolean {
+/** HTTP status of a failed request (axios sets `response.status`), if any. */
+function httpStatus(error: Error): number | undefined {
+  const status = (error as { response?: { status?: unknown } }).response?.status;
+  return typeof status === "number" ? status : undefined;
+}
+
+/**
+ * Decide retryability from the HTTP status on the error object, never from
+ * digits in the message: an RPC message such as "startLedger must be between
+ * 51234 and 61234" is permanent, not a 5xx (#1229). JSON-RPC errors arrive as
+ * plain `{ code, message }` objects over HTTP 200 and are never retried.
+ */
+export function isTransientError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
-  const msg = error.message;
-  return /fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|socket|timeout|429|5\d\d|rate limit/i.test(
-    msg,
+  const status = httpStatus(error);
+  if (status !== undefined) return status === 429 || (status >= 500 && status <= 599);
+  return /fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|socket|timeout|rate limit/i.test(
+    error.message,
   );
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Resolves after `ms`, or early as soon as `signal` aborts. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true },
+    );
+  });
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error("RPC request aborted by shutdown");
 }
 
 async function withRetry<T>(
@@ -60,13 +92,15 @@ async function withRetry<T>(
     maxRetries?: number;
     baseDelayMs?: number;
     maxDelayMs?: number;
-    sleepImpl?: (ms: number) => Promise<void>;
+    signal?: AbortSignal;
+    sleepImpl?: (ms: number, signal?: AbortSignal) => Promise<void>;
   } = {},
 ): Promise<T> {
   const {
     maxRetries = DEFAULT_MAX_RETRIES,
     baseDelayMs = DEFAULT_BASE_DELAY_MS,
     maxDelayMs = DEFAULT_MAX_DELAY_MS,
+    signal,
     sleepImpl = sleep,
   } = opts;
 
@@ -76,13 +110,15 @@ async function withRetry<T>(
       return await fn();
     } catch (error) {
       attempt += 1;
-      if (attempt > maxRetries || !isTransientError(error)) throw error;
+      if (attempt > maxRetries || !isTransientError(error) || signal?.aborted) {
+        throw error;
+      }
       const jitter = Math.random() * 0.5 + 0.75; // ±25%
       const delay = Math.min(
         maxDelayMs,
         baseDelayMs * 2 ** (attempt - 1) * jitter,
       );
-      await sleepImpl(delay);
+      await sleepImpl(delay, signal);
     }
   }
 }
@@ -99,8 +135,9 @@ export class SorobanRpcClient implements RpcClient {
     contractIds: string[];
     cursor?: string;
     limit?: number;
+    signal?: AbortSignal;
   }): Promise<GetEventsResult> {
-    const { startLedger, contractIds, cursor: initialCursor } = opts;
+    const { startLedger, contractIds, cursor: initialCursor, signal } = opts;
     const limit = opts.limit ?? this.maxPage;
 
     const filters = [
@@ -110,40 +147,47 @@ export class SorobanRpcClient implements RpcClient {
       },
     ];
 
-    return withRetry(async () => {
-      const allEvents: RawRpcEvent[] = [];
-      let latestLedger = 0;
-      let cursor: string | undefined = initialCursor;
+    const allEvents: RawRpcEvent[] = [];
+    let latestLedger = 0;
+    let cursor: string | undefined = initialCursor;
 
-      do {
-        const request = cursor
-          ? { filters, cursor, limit }
-          : { filters, startLedger, limit };
+    // Retry each page on its own (#1231): a transient failure on page N
+    // re-requests page N with the same cursor, keeping pages 1..N-1.
+    do {
+      throwIfAborted(signal);
+      const request = cursor
+        ? { filters, cursor, limit }
+        : { filters, startLedger, limit };
 
-        const response = await this.server.getEvents(
-          request as rpc.Api.GetEventsRequest,
-        );
+      const response = await withRetry(
+        () => this.server.getEvents(request as rpc.Api.GetEventsRequest),
+        { signal },
+      );
 
-        latestLedger = Math.max(latestLedger, Number(response.latestLedger ?? 0));
+      latestLedger = Math.max(latestLedger, Number(response.latestLedger ?? 0));
 
-        for (const ev of response.events) {
-          allEvents.push({
-            id: ev.id,
-            contractId: ev.contractId?.toString() ?? "",
-            ledger: Number(ev.ledger),
-            ledgerClosedAt: ev.ledgerClosedAt ?? null,
-            txHash: ev.txHash,
-            eventIndex: parseEventIndex(ev.id),
-            topic: ev.topic,
-            value: ev.value,
-            inSuccessfulContractCall: ev.inSuccessfulContractCall,
-          });
-        }
-        cursor = response.cursor || undefined;
-      } while (cursor);
+      for (const ev of response.events) {
+        allEvents.push({
+          id: ev.id,
+          contractId: ev.contractId?.toString() ?? "",
+          ledger: Number(ev.ledger),
+          ledgerClosedAt: ev.ledgerClosedAt ?? null,
+          txHash: ev.txHash,
+          eventIndex: parseEventIndex(ev.id),
+          topic: ev.topic,
+          value: ev.value,
+          inSuccessfulContractCall: ev.inSuccessfulContractCall,
+        });
+      }
+      cursor = response.cursor || undefined;
+    } while (cursor);
 
-      return { events: allEvents, latestLedger };
-    });
+    return { events: allEvents, latestLedger };
+  }
+
+  async getOldestLedger(signal?: AbortSignal): Promise<number> {
+    const health = await withRetry(() => this.server.getHealth(), { signal });
+    return health.oldestLedger;
   }
 }
 

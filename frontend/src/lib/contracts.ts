@@ -39,8 +39,6 @@ import { TIER_ORDER } from "@/types";
 // specs) are never executed at runtime — they are type-checked only.
 import type { UserProfile as ContractUserProfile } from "./bindings/registry/src";
 import type { BotTier as ContractBotTier } from "./bindings/bot_nft/src";
-import type { Client as RegistryGeneratedClient } from "./bindings/registry/src";
-import type { Client as BotNftGeneratedClient } from "./bindings/bot_nft/src";
 
 // Compile-time check: domain UserProfile must cover the contract's shape.
 // Using `extends` with `unknown` ensures the check does not error even if the
@@ -204,19 +202,24 @@ async function buildTxXdr(
 /**
  * Parse a raw scVal map from the registry contract into a typed UserProfile.
  *
- * The on-chain struct carries six fields: `address`, `username`,
- * `total_points`, `claimed_amt`, `registered_at`, `bot_count`. All are
- * required and validated via {@link toBigInt}; an absent or garbage field
+ * The on-chain struct carries `address`, `username`, `display_name`,
+ * `total_points`, `claimed_amt`, `registered_at`, `bot_count`. The numeric
+ * fields are validated via {@link toBigInt}; an absent or garbage field
  * throws naming the field. `points` is retained as an alias for
  * `total_points` and `claimedAmt`/`registeredAt`/`botCount` as camelCase
  * aliases for their snake_case contract fields so existing UI code keeps
  * working while the leaderboard/profile pages can render the full struct.
+ *
+ * `display_name` (#373) preserves the casing the user registered with;
+ * profiles recorded before #373 (and older mocks) omit it, so it falls back
+ * to the normalized `username` rather than throwing.
  */
 export function parseUserProfile(
   rawData: Record<string, unknown>
 ): UserProfile {
   const address = String(rawData.address ?? "");
   const username = String(rawData.username ?? "");
+  const display_name = String(rawData.display_name || username);
   const total_points = toBigInt(rawData.total_points, "total_points");
   // The three fields below are genuinely on-chain but older mocks / fixtures
   // may omit them; treat as optional with explicit 0 fallback so a missing
@@ -231,6 +234,7 @@ export function parseUserProfile(
   return {
     address,
     username,
+    display_name,
     total_points,
     points: total_points,
     claimed_amt,
@@ -441,6 +445,69 @@ export async function getLeaderboard(
 }
 
 /**
+ * The registry's current season number (#371). Season `0` is the default
+ * before an admin has called `start_new_season`; each call rolls the number
+ * forward and starts a fresh season board.
+ */
+export async function getSeason(sourceAddress?: string): Promise<number> {
+  const raw = await simulateContractCall<number>(
+    CONTRACT_ADDRESSES.registry,
+    "get_season",
+    [],
+    defaultSource(sourceAddress)
+  );
+  return Number(raw);
+}
+
+/**
+ * One season's leaderboard rows (#371), ranked by `season_points`.
+ *
+ * Mapped onto the `UserProfile` shape the table already renders: `points`
+ * carries the season total (what the row is ranked by), `total_points`
+ * keeps the lifetime total the contract sends alongside, and the
+ * claim/registration fields are zeroed — they are not part of a season row.
+ */
+export async function getLeaderboardForSeason(
+  season: number,
+  limit: number = 50,
+  sourceAddress?: string
+): Promise<UserProfile[]> {
+  const raw = await simulateContractCall<Record<string, unknown>[]>(
+    CONTRACT_ADDRESSES.registry,
+    "get_leaderboard_for_season",
+    [
+      nativeToScVal(season, { type: "u32" }),
+      nativeToScVal(limit, { type: "u32" }),
+    ],
+    defaultSource(sourceAddress)
+  );
+  if (!Array.isArray(raw)) {
+    throw new Error(
+      `get_leaderboard_for_season returned unexpected type ${typeof raw}; expected array`
+    );
+  }
+  return raw.map((entry) => {
+    const address = String(entry.address ?? "");
+    const display_name = String(entry.display_name ?? "");
+    const season_points = toBigInt(entry.season_points, "season_points");
+    const total_points = toBigInt(entry.total_points, "total_points");
+    return {
+      address,
+      username: display_name,
+      display_name,
+      total_points,
+      points: season_points,
+      claimed_amt: 0n,
+      claimedAmt: 0n,
+      registered_at: 0,
+      registeredAt: 0,
+      bot_count: 0,
+      botCount: 0,
+    };
+  });
+}
+
+/**
  * The registry's `get_rank` returns `u32::MAX` for a user who sits below the
  * ranked cutoff. Treated as "unranked", never as a position.
  */
@@ -470,11 +537,22 @@ export interface UserRank {
 /**
  * Ask the registry directly where a user stands (AM-052's `get_rank`).
  *
- * Returns `null` — never throws — when the user is unranked, when they are
- * not registered, or when the deployed registry predates `get_rank`. The
- * caller falls back to deriving the rank from the leaderboard ordering,
- * which is the same ordering `get_rank` reports.
+ * Returns `null` for the unranked sentinel or when the deployed registry
+ * predates `get_rank`; other simulation errors propagate to the caller.
  */
+function isMissingGetRankMethod(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message;
+  return (
+    /(?:unknown|no such|missing|unsupported)\s+(?:contract\s+)?(?:function|method)\s+[`'"]?get_rank\b/i.test(
+      message,
+    ) ||
+    /\bno\s+get_rank\b/i.test(message) ||
+    // Soroban reports a call to an absent contract entry point as Contract #0.
+    /Error\(Contract,\s*#0\b/.test(message)
+  );
+}
+
 async function getRegistryRank(
   userAddress: string,
   sourceAddress: string
@@ -491,8 +569,9 @@ async function getRegistryRank(
       return null;
     }
     return rank;
-  } catch {
-    return null;
+  } catch (error) {
+    if (isMissingGetRankMethod(error)) return null;
+    throw error;
   }
 }
 
@@ -526,7 +605,7 @@ export async function getUserRank(
   // position, and the user's own profile for their points.
   const [rank, profile] = await Promise.all([
     getRegistryRank(userAddress, source),
-    getUserProfile(userAddress).catch(() => null),
+    getUserProfile(userAddress),
   ]);
 
   if (!profile) return null;
@@ -889,7 +968,7 @@ export async function getAccrualConfig(
 ): Promise<{ pointsPerAmt: number }> {
   const source = defaultSource(sourceAddress);
   const raw = await simulateContractCall<Record<string, unknown>>(
-    ACCRUAL_CONTRACT_ID,
+    CONTRACT_ADDRESSES.accrual,
     "config",
     [],
     source
@@ -910,45 +989,6 @@ export async function getPendingPoints(userAddress: string): Promise<bigint> {
     userAddress
   );
   return toBigInt(raw, "pending_points");
-}
-
-/**
- * Get the accrual contract configuration (points_per_amt).
- * Calls the accrual contract's config() function.
- */
-export async function getAccrualConfig(callerAddress?: string): Promise<{ points_per_amt: bigint } | null> {
-  const server = getServer();
-  const contract = new Contract(ACCRUAL_CONTRACT_ID);
-  const source = callerAddress ?? (typeof window !== "undefined" ? (window as any)?.selectedPublicKey : undefined);
-
-  if (!source) {
-    return { points_per_amt: BigInt(POINTS_PER_AMT) };
-  }
-
-  try {
-    const result = await server.simulateTransaction(
-      new TransactionBuilder(
-        await server.getAccount(source),
-        { fee: "100", networkPassphrase: STELLAR_NETWORK_PASSPHRASE }
-      )
-        .addOperation(contract.call("config"))
-        .setTimeout(30)
-        .build()
-    );
-
-    if (SorobanRpc.Api.isSimulationError(result) || !result.result?.retval) {
-      return { points_per_amt: BigInt(POINTS_PER_AMT) };
-    }
-
-    const configRaw = scValToNative(result.result.retval);
-    if (!configRaw) return { points_per_amt: BigInt(POINTS_PER_AMT) };
-
-    return {
-      points_per_amt: toBigInt(configRaw.points_per_amt),
-    };
-  } catch {
-    return { points_per_amt: BigInt(POINTS_PER_AMT) };
-  }
 }
 
 /**
@@ -1027,6 +1067,81 @@ export async function getUserProfile(userAddress: string): Promise<UserProfile |
   if (!profileRaw) return null;
   return parseUserProfile(profileRaw);
 }
+
+/** Read only the user's points scalar, without decoding their profile string. */
+export async function getUserPoints(userAddress: string): Promise<bigint> {
+  const raw = await simulateContractCall<unknown>(
+    CONTRACT_ADDRESSES.registry,
+    "get_points",
+    [nativeToScVal(userAddress, { type: "address" })],
+    userAddress
+  );
+  return toBigInt(raw, "points");
+}
+
+/** Read only the user's bot count scalar. */
+export async function getUserBotCount(userAddress: string): Promise<number> {
+  const raw = await simulateContractCall<unknown>(
+    CONTRACT_ADDRESSES.registry,
+    "get_bot_count",
+    [nativeToScVal(userAddress, { type: "address" })],
+    userAddress
+  );
+  return Number(toBigInt(raw, "bot_count"));
+}
+
+/** Read only the user's claimed AMT scalar. */
+export async function getUserClaimedAmt(userAddress: string): Promise<bigint> {
+  const raw = await simulateContractCall<unknown>(
+    CONTRACT_ADDRESSES.registry,
+    "get_claimed_amt",
+    [nativeToScVal(userAddress, { type: "address" })],
+    userAddress
+  );
+  return toBigInt(raw, "claimed_amt");
+}
+
+/** Most addresses `get_users_batch` accepts in one call. */
+export const MAX_USERS_BATCH = 50;
+
+/**
+ * Get user profiles for up to {@link MAX_USERS_BATCH} addresses in a single
+ * registry simulation.
+ *
+ * Results are returned in the same order as `addresses`; unregistered
+ * addresses map to `null`. Passing more than {@link MAX_USERS_BATCH}
+ * addresses throws an error (matching the contract's `BatchTooLarge` error).
+ * Every RPC or contract error propagates so React Query's `isError` path fires.
+ */
+export async function getUsersBatch(
+  addresses: string[],
+  sourceAddress?: string
+): Promise<(UserProfile | null)[]> {
+  if (addresses.length === 0) return [];
+  if (addresses.length > MAX_USERS_BATCH) {
+    throw new Error(
+      `getUsersBatch accepts at most ${MAX_USERS_BATCH} addresses, got ${addresses.length}`
+    );
+  }
+  const raw = await simulateContractCall<(Record<string, unknown> | null)[]>(
+    CONTRACT_ADDRESSES.registry,
+    "get_users_batch",
+    [
+      xdr.ScVal.scvVec(
+        addresses.map((address) => nativeToScVal(address, { type: "address" }))
+      ),
+    ],
+    sourceAddress ?? addresses[0] ?? defaultSource()
+  );
+  if (!Array.isArray(raw)) {
+    throw new Error(
+      `get_users_batch returned unexpected type ${typeof raw}; expected array`
+    );
+  }
+  return raw.map((entry) => (entry ? parseUserProfile(entry) : null));
+}
+
+export const getUserProfiles = getUsersBatch;
 
 /**
  * Get the list of bot IDs owned by a user from the bot_nft contract (#481).
@@ -1128,27 +1243,11 @@ export async function getBotsRange(
  */
 export async function getAllTiers(sourceAddress?: string): Promise<Record<BotTier, TierInfo>> {
   const source = defaultSource(sourceAddress);
-  const tiers = await Promise.all(
-    TIER_ORDER.map(async (tier, index): Promise<TierInfo> => {
-      const raw = await simulateContractCall<unknown[]>(
-        CONTRACT_ADDRESSES.botNft,
-        "get_tier_info",
-        [nativeToScVal(index, { type: "u32" })],
-        source
-      );
-      if (!Array.isArray(raw) || raw.length !== 3) {
-        throw new Error(
-          `get_tier_info returned unexpected shape for ${tier}; expected [name, rate, price]`
-        );
-      }
-      const [name, rate, price] = raw;
-      return {
-        tier,
-        name: String(name),
-        rate: toBigInt(rate, "rate"),
-        price: toBigInt(price, "price"),
-      };
-    })
+  const raw = await simulateContractCall<Array<{ name: unknown; rate: unknown; price: unknown }>>(
+    CONTRACT_ADDRESSES.botNft,
+    "all_tiers",
+    [],
+    source
   );
   if (!Array.isArray(raw) || raw.length !== 5) {
     throw new Error(

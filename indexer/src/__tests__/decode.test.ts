@@ -10,6 +10,7 @@ import {
 import {
   G1,
   G2,
+  G3,
   CREG,
   CBOT,
   CACC,
@@ -26,6 +27,17 @@ import {
 } from "./helpers.js";
 
 const config = testConfig();
+
+describe("numeric normalization", () => {
+  it("rejects bigint values that cannot be represented safely as numbers", () => {
+    expect(() => toNum(BigInt(Number.MAX_SAFE_INTEGER) + 1n)).toThrow(RangeError);
+  });
+
+  it("preserves full-width identifiers as decimal strings", () => {
+    const listingId = 18_446_744_073_709_551_615n;
+    expect(toDecimal(listingId)).toBe("18446744073709551615");
+  });
+});
 
 describe("decodeRawEvent", () => {
   it("registry.register: topics=[user], data=timestamp(u64)", () => {
@@ -63,6 +75,107 @@ describe("decodeRawEvent", () => {
     );
     expect(ev.event).toBe("dec_bot");
     expect(toNum(ev.data)).toBe(4);
+  });
+
+  it("registry.init: topics=[admin], data=timestamp(u64)", () => {
+    const ev = decodeRawEvent(
+      makeRawEvent({
+        contractId: CREG,
+        topics: [sym("init"), addr(G1)],
+        value: u64(1700000001),
+      }),
+    );
+    expect(ev.event).toBe("init");
+    expect(ev.topics).toEqual([G1]);
+    expect(toNum(ev.data)).toBe(1700000001);
+  });
+
+  it("registry.writers: topics=[name only], data=[accrual, bot_nft]", () => {
+    const ev = decodeRawEvent(
+      makeRawEvent({
+        contractId: CREG,
+        topics: [sym("writers")],
+        value: vec([addr(G2), addr(G3)]),
+      }),
+    );
+    expect(ev.event).toBe("writers");
+    expect(ev.topics).toEqual([]);
+    expect(ev.data).toEqual([G2, G3]);
+  });
+
+  it("registry.inc_bot: data=bot_count(u32)", () => {
+    const ev = decodeRawEvent(
+      makeRawEvent({
+        contractId: CREG,
+        topics: [sym("inc_bot"), addr(G1)],
+        value: u32(2),
+      }),
+    );
+    expect(ev.event).toBe("inc_bot");
+    expect(toNum(ev.data)).toBe(2);
+  });
+
+  it("registry.claimed: data=amount(i128), serialized as a decimal string (#370)", () => {
+    const ev = decodeRawEvent(
+      makeRawEvent({
+        contractId: CREG,
+        topics: [sym("claimed"), addr(G1)],
+        value: i128(25000000n),
+      }),
+    );
+    expect(ev.event).toBe("claimed");
+    expect(ev.topics).toEqual([G1]);
+    expect(toDecimal(ev.data)).toBe("25000000");
+  });
+
+  it("registry.newseason: topics=[name only], data=season(u32) (#371)", () => {
+    const ev = decodeRawEvent(
+      makeRawEvent({
+        contractId: CREG,
+        topics: [sym("newseason")],
+        value: u32(3),
+      }),
+    );
+    expect(ev.event).toBe("newseason");
+    expect(ev.topics).toEqual([]);
+    expect(toNum(ev.data)).toBe(3);
+  });
+
+  it("registry.set_admin: data=[current, pending] two-address tuple (#372)", () => {
+    const ev = decodeRawEvent(
+      makeRawEvent({
+        contractId: CREG,
+        topics: [sym("set_admin")],
+        value: vec([addr(G1), addr(G2)]),
+      }),
+    );
+    expect(ev.event).toBe("set_admin");
+    expect(ev.topics).toEqual([]);
+    expect(ev.data).toEqual([G1, G2]);
+  });
+
+  it("registry.adm_acpt: data=[current, pending] (#372)", () => {
+    const ev = decodeRawEvent(
+      makeRawEvent({
+        contractId: CREG,
+        topics: [sym("adm_acpt")],
+        value: vec([addr(G1), addr(G2)]),
+      }),
+    );
+    expect(ev.event).toBe("adm_acpt");
+    expect(ev.data).toEqual([G1, G2]);
+  });
+
+  it("registry.adm_cncl: data=[current, pending] (#372)", () => {
+    const ev = decodeRawEvent(
+      makeRawEvent({
+        contractId: CREG,
+        topics: [sym("adm_cncl")],
+        value: vec([addr(G1), addr(G2)]),
+      }),
+    );
+    expect(ev.event).toBe("adm_cncl");
+    expect(ev.data).toEqual([G1, G2]);
   });
 
   it("bot_nft.mint (mint_tier): data=[bot_id(u64), tier(symbol)]", () => {
@@ -131,12 +244,12 @@ describe("decodeRawEvent", () => {
     expect(toNum(data[1])).toBe(200);
   });
 
-  it("marketplace.listed: topics=[seller, listing_id], data=[bot_id, price(i128)]", () => {
+  it("marketplace.listed: topics=[seller, listing_id], data=[bot_id, price(i128), currency]", () => {
     const ev = decodeRawEvent(
       makeRawEvent({
         contractId: CMAR,
         topics: [sym("listed"), addr(G1), u64(9)],
-        value: vec([u64(3), i128(5000000000)]),
+        value: vec([u64(3), i128(5000000000), addr(CTOK)]),
       }),
     );
     expect(ev.event).toBe("listed");
@@ -145,31 +258,48 @@ describe("decodeRawEvent", () => {
     const data = ev.data as unknown[];
     expect(toNum(data[0])).toBe(3);
     expect(toDecimal(data[1])).toBe("5000000000");
+    expect(data[2]).toBe(CTOK);
   });
 
-  it("marketplace.cancelled: data=bot_id(u64)", () => {
+  it("marketplace.cancel: topics=[seller, listing_id], data=bot_id(u64)", () => {
     const ev = decodeRawEvent(
       makeRawEvent({
         contractId: CMAR,
-        topics: [sym("cancelled"), addr(G1), u64(9)],
+        topics: [sym("cancel"), addr(G1), u64(9)],
         value: u64(3),
       }),
     );
-    expect(ev.event).toBe("cancelled");
+    expect(ev.event).toBe("cancel");
     expect(toNum(ev.data)).toBe(3);
   });
 
-  it("marketplace.bought: data=[bot_id, price(i128)]", () => {
+  it("marketplace.sold: topics=[seller, buyer], data=[listing_id, bot_id, price(i128), currency]", () => {
     const ev = decodeRawEvent(
       makeRawEvent({
         contractId: CMAR,
-        topics: [sym("bought"), addr(G2), u64(9)],
-        value: vec([u64(3), i128(5000000000)]),
+        topics: [sym("sold"), addr(G1), addr(G2)],
+        value: vec([u64(9), u64(3), i128(5000000000), addr(CTOK)]),
       }),
     );
-    expect(ev.event).toBe("bought");
-    expect(ev.topics[0]).toBe(G2);
-    expect(toDecimal((ev.data as unknown[])[1])).toBe("5000000000");
+    expect(ev.event).toBe("sold");
+    expect(ev.topics[0]).toBe(G1);
+    expect(ev.topics[1]).toBe(G2);
+    const data = ev.data as unknown[];
+    expect(toNum(data[0])).toBe(9);
+    expect(toDecimal(data[2])).toBe("5000000000");
+    expect(data[3]).toBe(CTOK);
+  });
+
+  it("marketplace.price_upd: topics=[seller, listing_id], data=[old_price, new_price]", () => {
+    const ev = decodeRawEvent(
+      makeRawEvent({
+        contractId: CMAR,
+        topics: [sym("price_upd"), addr(G1), u64(9)],
+        value: vec([i128(100), i128(120)]),
+      }),
+    );
+    expect(ev.event).toBe("price_upd");
+    expect(toDecimal((ev.data as unknown[])[1])).toBe("120");
   });
 
   it("token.approve: data=[amount(i128), expiration_ledger(u32)]", () => {
@@ -270,12 +400,11 @@ describe("contractNameFor / makeDecoder", () => {
     const ev = decoder.decode(
       makeRawEvent({
         contractId: CMAR,
-        topics: [sym("bought"), addr(G2), u64(1)],
-        value: vec([u64(1), i128(5)]),
+        topics: [sym("sold"), addr(G1), addr(G2)],
+        value: vec([u64(1), u64(1), i128(5), addr(CTOK)]),
       }),
     );
     expect(ev.contract).toBe("marketplace");
     expect(ev.contractId).toBe(CMAR);
   });
 });
-
