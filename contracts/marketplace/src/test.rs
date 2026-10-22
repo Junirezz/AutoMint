@@ -2,12 +2,19 @@
 
 #![cfg(test)]
 #![allow(clippy::inconsistent_digit_grouping)]
+/// This crate's own `BotTier` under an alias: the explicit `BotTier` import
+/// above shadows the `super::*` glob (bot_nft's client arguments need it),
+/// while `tier_stats` and `DataKey::TierStats` take the marketplace type.
+use super::BotTier as MktBotTier;
 use super::*;
-use automint_bot_nft::BotNFTContractClient;
+use automint_bot_nft::{BotNFTContractClient, BotTier};
 use automint_registry::RegistryContractClient;
 use automint_testutils::{deploy_all, deploy_bot_nft_with_registry, register_user};
 use automint_token::AMTTokenClient;
-use soroban_sdk::{testutils::Address as _, Env};
+use soroban_sdk::{
+    testutils::{Address as _, Events},
+    Env, TryFromVal,
+};
 extern crate std;
 
 // Tier supply is capped at 50 per tier, so bulk-listing tests spread bots
@@ -1937,6 +1944,135 @@ fn test_bot_nft_getter() {
     assert_eq!(h.mkt.bot_nft(), h.bot.address);
 }
 
+// ── #912: rotating the bot NFT address vs escrowed listings ───────────────
+
+#[test]
+fn set_bot_nft_is_rejected_while_a_listing_holds_a_bot() {
+    let h = setup();
+    let seller = Address::generate(&h.env);
+    let bot_id = h.bot.mint_basic(&seller);
+    let listing_id = h.mkt.list_bot(
+        &seller,
+        &bot_id,
+        &50_0000000_i128,
+        &h.token.address,
+        &604_800_u64,
+    );
+    let (new_bot_nft, _) = deploy_bot_nft_with_registry(&h.env, &h.admin, &h.registry.address);
+
+    let result = h.mkt.try_set_bot_nft(&new_bot_nft);
+    assert_eq!(result, Err(Ok(MarketplaceError::ActiveListingsExist)));
+    assert_eq!(h.mkt.bot_nft(), h.bot.address);
+
+    // The escrowed bot still settles through the original contract.
+    h.mkt.cancel_listing(&seller, &listing_id);
+    assert_eq!(h.bot.get_bot(&bot_id).owner, seller);
+}
+
+#[test]
+fn set_bot_nft_succeeds_once_every_listing_has_settled() {
+    let h = setup();
+    let seller = Address::generate(&h.env);
+    let buyer = Address::generate(&h.env);
+    let cancelled_bot = h.bot.mint_basic(&seller);
+    let sold_bot = h.bot.mint_basic(&seller);
+    let cancelled = h.mkt.list_bot(
+        &seller,
+        &cancelled_bot,
+        &50_0000000_i128,
+        &h.token.address,
+        &604_800_u64,
+    );
+    let sold = h.mkt.list_bot(
+        &seller,
+        &sold_bot,
+        &50_0000000_i128,
+        &h.token.address,
+        &604_800_u64,
+    );
+    h.token.mint(&buyer, &50_0000000_i128);
+    h.mkt.buy_bot(&buyer, &sold);
+
+    // One listing is still escrowing a bot, so rotation stays blocked.
+    let (new_bot_nft, _) = deploy_bot_nft_with_registry(&h.env, &h.admin, &h.registry.address);
+    assert_eq!(
+        h.mkt.try_set_bot_nft(&new_bot_nft),
+        Err(Ok(MarketplaceError::ActiveListingsExist))
+    );
+
+    h.mkt.cancel_listing(&seller, &cancelled);
+    h.mkt.set_bot_nft(&new_bot_nft);
+    assert_eq!(h.mkt.bot_nft(), new_bot_nft);
+}
+
+// ── #911: combined fee + royalty cap on set_fee_bps ──────────────────────
+
+#[test]
+fn set_fee_bps_enforces_the_combined_fee_and_royalty_cap() {
+    let h = setup();
+    h.env.mock_all_auths();
+
+    // Fee and royalty together may use the whole 10,000 bps and no more.
+    let mkt_id = h.env.register_contract(None, MarketplaceContract);
+    let mkt = MarketplaceContractClient::new(&h.env, &mkt_id);
+    mkt.initialize(&h.admin, &h.bot.address, &100u32, &9_900u32);
+
+    mkt.set_fee_bps(&100u32);
+    assert_eq!(mkt.config().fee_bps, 100);
+    assert_eq!(
+        mkt.try_set_fee_bps(&101u32),
+        Err(Ok(MarketplaceError::InvalidPrice))
+    );
+    assert_eq!(
+        mkt.config().fee_bps,
+        100,
+        "a rejected fee update must leave the fee unchanged"
+    );
+
+    // With no royalty the fee alone may reach 10,000 bps but not exceed it.
+    h.mkt.set_fee_bps(&10_000u32);
+    assert_eq!(h.mkt.config().fee_bps, 10_000);
+    assert_eq!(
+        h.mkt.try_set_fee_bps(&10_001u32),
+        Err(Ok(MarketplaceError::InvalidPrice))
+    );
+    assert_eq!(h.mkt.config().fee_bps, 10_000);
+}
+
+// ── #910: sale and listing events identify their currency ─────────────────
+
+#[test]
+fn listed_and_sold_events_carry_the_currency() {
+    let h = setup();
+    let seller = Address::generate(&h.env);
+    let buyer = Address::generate(&h.env);
+    let bot_id = h.bot.mint_basic(&seller);
+    let price = 50_0000000_i128;
+    let listing_id = h
+        .mkt
+        .list_bot(&seller, &bot_id, &price, &h.token.address, &604_800_u64);
+
+    let events = h.env.events().all();
+    let (_, _, data) = events.last().unwrap();
+    let (listed_bot, listed_price, listed_currency): (u64, i128, Address) =
+        <(u64, i128, Address)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(listed_bot, bot_id);
+    assert_eq!(listed_price, price);
+    assert_eq!(listed_currency, h.token.address);
+
+    h.token.mint(&buyer, &price);
+    h.mkt.buy_bot(&buyer, &listing_id);
+
+    let events = h.env.events().all();
+    let (_, _, data) = events.last().unwrap();
+    let (sold_listing, sold_bot, sold_price, sold_currency): (u64, u64, i128, Address) =
+        <(u64, u64, i128, Address)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(sold_listing, listing_id);
+    assert_eq!(sold_bot, bot_id);
+    assert_eq!(sold_price, price);
+    assert_eq!(sold_currency, h.token.address);
+}
+
 #[test]
 fn test_per_seller_listing_limit() {
     let h = setup();
@@ -2146,7 +2282,7 @@ fn test_tier_stats_follow_a_scripted_sequence_of_sales() {
     let buyer = Address::generate(&h.env);
     h.token.mint(&buyer, &1000_0000000_i128);
 
-    let stats = h.mkt.tier_stats(&BotTier::Basic);
+    let stats = h.mkt.tier_stats(&MktBotTier::Basic);
     assert_eq!(stats.volume, 0);
     assert_eq!(stats.sale_count, 0);
     assert_eq!(stats.floor_price, 0);
@@ -2170,13 +2306,13 @@ fn test_tier_stats_follow_a_scripted_sequence_of_sales() {
 
     // The floor is the cheapest active listing.
     assert_eq!(
-        h.mkt.tier_stats(&BotTier::Basic).floor_price,
+        h.mkt.tier_stats(&MktBotTier::Basic).floor_price,
         40_0000000_i128
     );
 
     // Buying the cheapest moves the floor to the next one.
     h.mkt.buy_bot(&buyer, &cheap);
-    let stats = h.mkt.tier_stats(&BotTier::Basic);
+    let stats = h.mkt.tier_stats(&MktBotTier::Basic);
     assert_eq!(stats.volume, 40_0000000_i128);
     assert_eq!(stats.sale_count, 1);
     assert_eq!(stats.last_sale_price, 40_0000000_i128);
@@ -2184,14 +2320,14 @@ fn test_tier_stats_follow_a_scripted_sequence_of_sales() {
 
     // Buying the last listing leaves no floor.
     h.mkt.buy_bot(&buyer, &dear);
-    let stats = h.mkt.tier_stats(&BotTier::Basic);
+    let stats = h.mkt.tier_stats(&MktBotTier::Basic);
     assert_eq!(stats.volume, 100_0000000_i128);
     assert_eq!(stats.sale_count, 2);
     assert_eq!(stats.last_sale_price, 60_0000000_i128);
     assert_eq!(stats.floor_price, 0);
 
     // Other tiers are untouched, and market_stats reports every tier.
-    assert_eq!(h.mkt.tier_stats(&BotTier::Gold).sale_count, 0);
+    assert_eq!(h.mkt.tier_stats(&MktBotTier::Gold).sale_count, 0);
     assert_eq!(h.mkt.market_stats().len(), 5);
 }
 
@@ -2219,21 +2355,21 @@ fn test_floor_updates_when_the_cheapest_listing_is_cancelled_or_repriced() {
     // Repricing the cheapest above the other moves the floor.
     h.mkt.update_price(&seller, &cheap, &80_0000000_i128);
     assert_eq!(
-        h.mkt.tier_stats(&BotTier::Basic).floor_price,
+        h.mkt.tier_stats(&MktBotTier::Basic).floor_price,
         60_0000000_i128
     );
 
     // Repricing below the floor lowers it.
     h.mkt.update_price(&seller, &dear, &50_0000000_i128);
     assert_eq!(
-        h.mkt.tier_stats(&BotTier::Basic).floor_price,
+        h.mkt.tier_stats(&MktBotTier::Basic).floor_price,
         50_0000000_i128
     );
 
     // Cancelling the floor listing falls back to the remaining one.
     h.mkt.cancel_listing(&seller, &dear);
     assert_eq!(
-        h.mkt.tier_stats(&BotTier::Basic).floor_price,
+        h.mkt.tier_stats(&MktBotTier::Basic).floor_price,
         80_0000000_i128
     );
 }
@@ -2804,7 +2940,7 @@ mod offers_and_fees {
         assert_eq!(offer.status, OfferStatus::Accepted);
         assert_eq!(h.mkt.get_offers_for_bot(&bot_id).len(), 0);
         assert_eq!(h.mkt.get_user_purchases(&buyer, &10).len(), 1);
-        assert_eq!(h.mkt.tier_stats(&BotTier::Basic).sale_count, 1);
+        assert_eq!(h.mkt.tier_stats(&MktBotTier::Basic).sale_count, 1);
         assert_eq!(last_event_topic(&h), symbol_short!("offer_acc"));
     }
 
@@ -3024,6 +3160,172 @@ mod offers_and_fees {
         assert_eq!(h.token.balance(&buyer), PRICE);
     }
 
+    // ---- offer lifetime and dismissal (#914) ----
+
+    /// Fill every offer slot on a fresh seller-owned bot with
+    /// maximum-lifetime offers from distinct buyers.
+    fn fill_offer_slots(h: &Harness) -> (Address, u64, std::vec::Vec<(Address, u64)>) {
+        let seller = Address::generate(&h.env);
+        let bot_id = h.bot.mint_basic(&seller);
+        let mut offers = std::vec::Vec::new();
+        for _ in 0..MAX_OFFERS_PER_BOT {
+            let buyer = Address::generate(&h.env);
+            h.token.mint(&buyer, &40);
+            let id = h.mkt.make_offer(
+                &buyer,
+                &bot_id,
+                &40,
+                &h.token.address,
+                &(now(h) + MAX_OFFER_DURATION),
+            );
+            offers.push((buyer, id));
+        }
+        (seller, bot_id, offers)
+    }
+
+    #[test]
+    fn make_offer_rejects_expiry_beyond_max_duration() {
+        let h = setup();
+        let seller = Address::generate(&h.env);
+        let buyer = Address::generate(&h.env);
+        let bot_id = h.bot.mint_basic(&seller);
+        h.token.mint(&buyer, &PRICE);
+        assert_eq!(
+            h.mkt.try_make_offer(
+                &buyer,
+                &bot_id,
+                &PRICE,
+                &h.token.address,
+                &(now(&h) + MAX_OFFER_DURATION + 1)
+            ),
+            Err(Ok(MarketplaceError::InvalidExpiry))
+        );
+        assert_eq!(
+            h.mkt
+                .try_make_offer(&buyer, &bot_id, &PRICE, &h.token.address, &u64::MAX),
+            Err(Ok(MarketplaceError::InvalidExpiry))
+        );
+        assert_eq!(h.token.balance(&buyer), PRICE);
+        // Exactly the maximum lifetime is accepted.
+        let id = h.mkt.make_offer(
+            &buyer,
+            &bot_id,
+            &PRICE,
+            &h.token.address,
+            &(now(&h) + MAX_OFFER_DURATION),
+        );
+        assert_eq!(
+            h.mkt.get_offer(&id).expires_at,
+            now(&h) + MAX_OFFER_DURATION
+        );
+    }
+
+    #[test]
+    fn long_lived_offers_exhausting_the_cap_free_up_at_max_duration() {
+        let h = setup();
+        let (_seller, bot_id, offers) = fill_offer_slots(&h);
+        let late = Address::generate(&h.env);
+        h.token.mint(&late, &40);
+        assert_eq!(
+            h.mkt
+                .try_make_offer(&late, &bot_id, &40, &h.token.address, &(now(&h) + DAY)),
+            Err(Ok(MarketplaceError::TooManyOffers))
+        );
+        // Once the bounded lifetime passes, anyone can clear a slot.
+        advance(&h, MAX_OFFER_DURATION);
+        let keeper = Address::generate(&h.env);
+        let (buyer, id) = offers[0].clone();
+        h.mkt.cancel_offer(&keeper, &id);
+        assert_eq!(h.token.balance(&buyer), 40);
+        h.mkt
+            .make_offer(&late, &bot_id, &40, &h.token.address, &(now(&h) + DAY));
+        assert_eq!(h.mkt.get_offers_for_bot(&bot_id).len(), MAX_OFFERS_PER_BOT);
+    }
+
+    #[test]
+    fn seller_can_dismiss_offers_exhausting_the_cap() {
+        let h = setup();
+        let (seller, bot_id, offers) = fill_offer_slots(&h);
+        let (buyer, id) = offers[3].clone();
+        h.mkt.dismiss_offer(&seller, &id);
+        assert_eq!(last_event_topic(&h), symbol_short!("offer_dsm"));
+        // The refund always goes to the buyer, never the dismisser.
+        assert_eq!(h.token.balance(&buyer), 40);
+        assert_eq!(h.token.balance(&seller), 0);
+        assert_eq!(h.mkt.get_offer(&id).status, OfferStatus::Cancelled);
+        assert_eq!(
+            h.mkt.get_offers_for_bot(&bot_id).len(),
+            MAX_OFFERS_PER_BOT - 1
+        );
+        let late = Address::generate(&h.env);
+        h.token.mint(&late, &40);
+        h.mkt
+            .make_offer(&late, &bot_id, &40, &h.token.address, &(now(&h) + DAY));
+        assert_eq!(
+            h.mkt.try_dismiss_offer(&seller, &id),
+            Err(Ok(MarketplaceError::OfferNotActive))
+        );
+    }
+
+    #[test]
+    fn listing_seller_and_admin_can_dismiss_offers() {
+        let h = setup();
+        let (seller, buyer, bot_id, offer_id) = offer_setup(&h);
+        h.mkt
+            .list_bot(&seller, &bot_id, &PRICE, &h.token.address, &WEEK);
+        // The marketplace holds the bot; the listing seller still controls it.
+        h.mkt.dismiss_offer(&seller, &offer_id);
+        assert_eq!(h.token.balance(&buyer), PRICE);
+
+        let other = Address::generate(&h.env);
+        h.token.mint(&other, &PRICE);
+        let id = h
+            .mkt
+            .make_offer(&other, &bot_id, &PRICE, &h.token.address, &(now(&h) + DAY));
+        h.mkt.dismiss_offer(&h.admin, &id);
+        assert_eq!(h.token.balance(&other), PRICE);
+        assert_eq!(h.token.balance(&h.admin), 0);
+        assert_eq!(h.mkt.get_offers_for_bot(&bot_id).len(), 0);
+    }
+
+    #[test]
+    fn dismiss_offer_rejects_third_parties_and_requires_auth() {
+        let h = setup();
+        let (seller, buyer, _bot_id, offer_id) = offer_setup(&h);
+        let stranger = Address::generate(&h.env);
+        assert_eq!(
+            h.mkt.try_dismiss_offer(&stranger, &offer_id),
+            Err(Ok(MarketplaceError::Unauthorized))
+        );
+        // The buyer is not the bot owner; they use `cancel_offer` instead.
+        assert_eq!(
+            h.mkt.try_dismiss_offer(&buyer, &offer_id),
+            Err(Ok(MarketplaceError::Unauthorized))
+        );
+        assert_eq!(
+            h.mkt.try_dismiss_offer(&seller, &999),
+            Err(Ok(MarketplaceError::OfferNotFound))
+        );
+        assert_eq!(h.token.balance(&h.mkt.address), PRICE);
+        h.env.mock_auths(&[]);
+        assert!(h.mkt.try_dismiss_offer(&seller, &offer_id).is_err());
+        assert_eq!(h.mkt.get_offer(&offer_id).status, OfferStatus::Active);
+    }
+
+    #[test]
+    fn previous_owner_cannot_dismiss_after_transfer() {
+        let h = setup();
+        let (seller, buyer, bot_id, offer_id) = offer_setup(&h);
+        let new_owner = Address::generate(&h.env);
+        h.bot.transfer(&bot_id, &seller, &new_owner);
+        assert_eq!(
+            h.mkt.try_dismiss_offer(&seller, &offer_id),
+            Err(Ok(MarketplaceError::Unauthorized))
+        );
+        h.mkt.dismiss_offer(&new_owner, &offer_id);
+        assert_eq!(h.token.balance(&buyer), PRICE);
+    }
+
     // ---- fees (#426) ----
 
     #[test]
@@ -3153,9 +3455,9 @@ mod offers_and_fees {
         let (seller, buyer, bot_id, offer_id) = offer_setup(&h);
         h.env.as_contract(&h.mkt.address, || {
             h.env.storage().persistent().set(
-                &DataKey::TierStats(BotTier::Basic),
+                &DataKey::TierStats(MktBotTier::Basic),
                 &TierStats {
-                    tier: BotTier::Basic,
+                    tier: MktBotTier::Basic,
                     volume: 0,
                     sale_count: u64::MAX,
                     last_sale_price: 0,
@@ -3173,5 +3475,204 @@ mod offers_and_fees {
         assert_eq!(h.token.balance(&buyer), 0);
         assert_eq!(h.token.balance(&h.mkt.address), PRICE);
         assert_eq!(h.mkt.get_offer(&offer_id).status, OfferStatus::Active);
+    }
+
+    // ---- user history growth (#916) ----
+
+    #[test]
+    fn user_listing_history_is_paged_and_reads_back_in_order() {
+        let h = setup();
+        h.env.budget().reset_unlimited();
+        h.mkt.set_listing_cap(&200);
+        let seller = Address::generate(&h.env);
+        let total: u32 = 120;
+        let mut ids: std::vec::Vec<u64> = std::vec::Vec::new();
+        for i in 0..total {
+            let tier = TIERS[i as usize % TIERS.len()];
+            let bot_id = h.bot.admin_mint(&seller, &tier);
+            let listing_id = h.mkt.list_bot(
+                &seller,
+                &bot_id,
+                &(100_0000000_i128 + i as i128),
+                &h.token.address,
+                &604_800_u64,
+            );
+            ids.push(listing_id);
+        }
+
+        // 120 entries span three pages of at most USER_HISTORY_PAGE_SIZE each.
+        h.env.as_contract(&h.mkt.address, || {
+            assert_eq!(
+                MarketplaceContract::user_listing_count(&h.env, &seller),
+                total
+            );
+            for (page, expected) in [(0, 50), (1, 50), (2, 20)] {
+                let stored: Vec<u64> = h
+                    .env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::UserListingPage(seller.clone(), page))
+                    .unwrap();
+                assert_eq!(stored.len(), expected);
+            }
+        });
+
+        let all = h.mkt.get_user_listings(&seller);
+        assert_eq!(all.len(), total);
+        for (i, listing) in all.iter().enumerate() {
+            assert_eq!(listing.id, ids[i]);
+        }
+
+        // A cursor walk with a small page size visits each listing once.
+        let mut cursor: u32 = 0;
+        let mut seen: std::vec::Vec<u64> = std::vec::Vec::new();
+        loop {
+            let (page, next) = h.mkt.get_user_listings_page(&seller, &cursor, &30);
+            assert!(page.len() <= 30);
+            for listing in page.iter() {
+                seen.push(listing.id);
+            }
+            match next {
+                Some(n) => cursor = n,
+                None => break,
+            }
+        }
+        assert_eq!(seen, ids);
+
+        // Requests above the page cap are clamped to it.
+        let (capped, _) = h.mkt.get_user_listings_page(&seller, &0, &500);
+        assert_eq!(capped.len(), MAX_HISTORY_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn user_purchase_history_is_paged_and_reads_back_recent_first_window() {
+        let h = setup();
+        let buyer = Address::generate(&h.env);
+        let seller = Address::generate(&h.env);
+        let total: u32 = 120;
+        h.env.as_contract(&h.mkt.address, || {
+            for i in 0..total {
+                MarketplaceContract::add_user_purchase(
+                    &h.env,
+                    &buyer,
+                    Purchase {
+                        listing_id: i as u64 + 1,
+                        bot_id: i as u64 + 1,
+                        seller: seller.clone(),
+                        price: 100_0000000_i128,
+                        currency: h.token.address.clone(),
+                        purchased_at: i as u64,
+                    },
+                );
+            }
+            for (page, expected) in [(0, 50), (1, 50), (2, 20)] {
+                let stored: Vec<Purchase> = h
+                    .env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::UserPurchasePage(buyer.clone(), page))
+                    .unwrap();
+                assert_eq!(stored.len(), expected);
+            }
+        });
+
+        // The window read returns the most recent purchases, oldest first.
+        let recent = h.mkt.get_user_purchases(&buyer, &10);
+        assert_eq!(recent.len(), 10);
+        assert_eq!(recent.get(0).unwrap().listing_id, 111);
+        assert_eq!(recent.get(9).unwrap().listing_id, 120);
+        assert_eq!(h.mkt.get_user_purchases(&buyer, &500).len(), total);
+
+        // A cursor walk visits every purchase once, in order.
+        let mut cursor: u32 = 0;
+        let mut seen: std::vec::Vec<u64> = std::vec::Vec::new();
+        loop {
+            let (page, next) = h.mkt.get_user_purchases_page(&buyer, &cursor, &50);
+            for purchase in page.iter() {
+                seen.push(purchase.listing_id);
+            }
+            match next {
+                Some(n) => cursor = n,
+                None => break,
+            }
+        }
+        let expected: std::vec::Vec<u64> = (1..=total as u64).collect();
+        assert_eq!(seen, expected);
+    }
+}
+
+// #915: with the bot NFT wired to this marketplace, every escrow exit's
+// `bot_nft.transfer` calls back into `on_bot_moved`. The listing must still be
+// retired exactly once, so a seller with several listings keeps an accurate
+// count (and cannot slip past the listing cap).
+mod escrow_exit_counts {
+    use super::*;
+    use soroban_sdk::testutils::Ledger as _;
+
+    const PRICE: i128 = 50_0000000;
+
+    /// Seller with three escrowed listings and the bot NFT notifying the
+    /// marketplace. Returns (seller, [(listing_id, bot_id); 3]).
+    fn three_listings(h: &Harness) -> (Address, [(u64, u64); 3]) {
+        h.env.mock_all_auths();
+        h.bot.set_marketplace(&h.mkt.address);
+        let seller = Address::generate(&h.env);
+        let mut out = [(0, 0); 3];
+        for slot in out.iter_mut() {
+            let bot_id = h.bot.mint_basic(&seller);
+            let id = h
+                .mkt
+                .list_bot(&seller, &bot_id, &PRICE, &h.token.address, &604_800_u64);
+            *slot = (id, bot_id);
+        }
+        assert_eq!(h.mkt.get_user_active_listing_count(&seller), 3);
+        (seller, out)
+    }
+
+    fn assert_two_left(h: &Harness, seller: &Address, exited: u64) {
+        assert!(!h.mkt.get_listing(&exited).active);
+        assert_eq!(h.mkt.get_user_active_listing_count(seller), 2);
+    }
+
+    #[test]
+    fn buy_bot_decrements_once() {
+        let h = setup();
+        let (seller, l) = three_listings(&h);
+        let buyer = Address::generate(&h.env);
+        h.token.mint(&buyer, &PRICE);
+        h.mkt.buy_bot(&buyer, &l[0].0);
+        assert_two_left(&h, &seller, l[0].0);
+    }
+
+    #[test]
+    fn cancel_listing_decrements_once() {
+        let h = setup();
+        let (seller, l) = three_listings(&h);
+        h.mkt.cancel_listing(&seller, &l[0].0);
+        assert_two_left(&h, &seller, l[0].0);
+    }
+
+    #[test]
+    fn reclaim_expired_decrements_once() {
+        let h = setup();
+        let (seller, l) = three_listings(&h);
+        let expires_at = h.mkt.get_listing(&l[0].0).expires_at;
+        h.env.ledger().with_mut(|li| li.timestamp = expires_at + 1);
+        h.mkt.reclaim_expired(&l[0].0);
+        assert_two_left(&h, &seller, l[0].0);
+    }
+
+    #[test]
+    fn accept_offer_decrements_once() {
+        let h = setup();
+        let (seller, l) = three_listings(&h);
+        let buyer = Address::generate(&h.env);
+        h.token.mint(&buyer, &PRICE);
+        let expires = h.env.ledger().timestamp() + 86_400;
+        let offer_id = h
+            .mkt
+            .make_offer(&buyer, &l[0].1, &PRICE, &h.token.address, &expires);
+        h.mkt.accept_offer(&seller, &offer_id);
+        assert_two_left(&h, &seller, l[0].0);
     }
 }

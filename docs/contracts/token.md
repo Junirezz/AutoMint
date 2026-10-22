@@ -1,6 +1,9 @@
 # AMT Token Contract API Reference
 
-The AMT Token contract is a Soroban-based token implementation with admin-controlled minting, burning, and allowance-based transfers.
+The AMT Token contract is a Soroban-based token implementation with
+admin-controlled minting, burning, and allowance-based transfers. It implements
+`soroban_sdk::token::TokenInterface` for standard token clients while retaining
+typed `Result` errors on the AMT-specific contract client.
 
 ## Public Functions
 
@@ -34,6 +37,26 @@ pub fn balance(env: Env, id: Address) -> i128
 ```
 
 Query the token balance for an address. Returns 0 if the address has no balance record.
+
+---
+
+### spendable_balance
+
+```rust
+pub fn spendable_balance(env: Env, id: Address) -> i128
+```
+
+Query the portion of `balance` that is actually transferable right now (SEP-41). Equals `balance` minus any reserve held in a (currently unused) `Locked` entry for `id`; returns 0 for an address with no balance record.
+
+---
+
+### bump_balance
+
+```rust
+pub fn bump_balance(env: Env, id: Address)
+```
+
+Permissionless keeper call that refreshes `id`'s balance entry TTL without modifying its amount. Anyone may call this; it is a no-op if `id` has no balance record. See [Balance TTL](#balance-ttl) below.
 
 ---
 
@@ -95,9 +118,11 @@ pub fn approve(
 
 Approve a spender to transfer up to `amount` tokens from `from`. Requires authorization from `from`.
 
-- `from == spender` returns `TokenError::Unauthorized`
 - Negative amounts return `TokenError::NegativeAmount`
-- Zero amounts are valid and stored as 0 allowance
+- Zero amounts are valid and stored as 0 allowance; a zero amount may use a past `expiration_ledger` as a revoke
+- A non-zero amount with `expiration_ledger` in the past returns `TokenError::InvalidExpiration`
+- An `expiration_ledger` beyond the network's maximum allowance window returns `TokenError::InvalidExpiration`
+- #341: self-approval (`from == spender`) is permitted per SEP-41
 
 ---
 
@@ -147,10 +172,39 @@ Burn tokens from an address. Requires authorization from `from`.
 pub fn set_admin(env: Env, new_admin: Address) -> Result<(), TokenError>
 ```
 
-Transfer admin rights to a new address. Requires authorization from the current admin.
+Propose an administrator transfer. Requires authorization from the current admin;
+the current admin remains active until `new_admin` calls `accept_admin`.
 
 - `new_admin == current_admin` returns `TokenError::Unauthorized`
 - Contract not initialized returns `TokenError::NotInitialized`
+
+---
+
+### accept_admin, cancel_admin_transfer, pending_admin
+
+```rust
+pub fn accept_admin(env: Env) -> Result<(), TokenError>
+pub fn cancel_admin_transfer(env: Env) -> Result<(), TokenError>
+pub fn pending_admin(env: Env) -> Option<Address>
+```
+
+Only the proposed address can accept a pending transfer. The current admin can
+cancel it; both actions clear `pending_admin`. `accept_admin` and
+`cancel_admin_transfer` return `TokenError::NoPendingAdmin` when no proposal is
+pending.
+
+---
+
+### set_metadata
+
+```rust
+pub fn set_metadata(env: Env, name: String, symbol: String) -> Result<(), TokenError>
+```
+
+Updates the token name and symbol and emits a `metadata` event containing the
+old and new values. Only the current admin may call it, and both values must be
+non-empty. Token decimals remain immutable: changing precision would silently
+reprice every existing integer balance.
 
 ---
 
@@ -206,15 +260,34 @@ Query the token symbol. Returns `TokenError::NotInitialized` if the contract is 
 | `NegativeAmount` | 6 | Amount is negative |
 | `AllowanceExpired` | 7 | Allowance has expired |
 | `Overflow` | 8 | Arithmetic overflow occurred |
+| `SupplyCapExceeded` | 9 | Mint would exceed the configured max supply |
+| `InvalidDecimals` | 10 | `decimal` was 0 at `initialize` |
+| `InvalidExpiration` | 11 | `approve`'s `expiration_ledger` is in the past (for a non-zero amount) or beyond the maximum allowance window |
+| `InvalidMetadata` | 12 | Name or symbol is empty |
+| `NoPendingAdmin` | 13 | No administrator transfer is pending |
+| `LengthMismatch` | 14 | `transfer_batch` received different counts of recipients and amounts |
+| `BatchTooLarge` | 15 | `transfer_batch` received more than `MAX_BATCH_SIZE` (100) recipients |
+| `Paused` | 1000 | Contract is paused |
+
+---
+
+## Balance TTL
+
+Balance entries are persistent storage, bumped to the network's maximum entry TTL (3,110,400 ledgers, ≈180 days at 5s/ledger) on every `mint`, `transfer`, `burn`/`burn_from`, or `bump_balance` call. The private storage helpers own those TTL extensions; public callers do not extend TTL directly. `balance()` and `spendable_balance()` are read-only and never extend TTL. A holder that transacts at least once within that window never archives; `bump_balance(id)` lets anyone (a keeper, a wallet, the holder) refresh a dormant balance's TTL without touching its amount.
 
 ---
 
 ## Events
 
-The contract emits the following events:
+The contract emits the following events, matching the Stellar Asset Contract (SAC) topic/data convention `topics = (name, ...addresses)`, `data = payload`:
 
-- `approve(from, spender)` with `(amount, expiration_ledger)`
-- `transfer(from, to)` with `amount`
-- `burn(from)` with `amount`
-- `mint(to)` with `amount`
-- `set_admin()` with `new_admin`
+| Function | Topics | Data |
+|----------|--------|------|
+| `transfer` | `("transfer", from, to)` | `amount: i128` |
+| `mint` | `("mint", admin, to)` | `amount: i128` |
+| `burn` | `("burn", from)` | `amount: i128` |
+| `approve` | `("approve", from, spender)` | `(amount: i128, expiration_ledger: u32)` |
+| `admin_proposed` | `("admin_proposed", current_admin)` | `pending_admin: Address` |
+| `set_admin` | `("set_admin", old_admin)` | `new_admin: Address` |
+| `admin_cancel` | `("admin_cancel",)` | `cancelled_admin: Address` |
+| `metadata` | `("metadata",)` | `(old_name, old_symbol, new_name, new_symbol)` |

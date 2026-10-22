@@ -133,7 +133,7 @@
             },
             "ext": "v0"
           },
-          120960
+          3110400
         ]
       ],
       [
@@ -175,7 +175,7 @@
             },
             "ext": "v0"
           },
-          120960
+          3110400
         ]
       ],
       [
@@ -206,6 +206,18 @@
                           "vec": [
                             {
                               "symbol": "Admin"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "PendingAdmin"
                             }
                           ]
                         },
@@ -257,7 +269,7 @@
             },
             "ext": "v0"
           },
-          120960
+          3110400
         ]
       ],
       [
@@ -377,7 +389,7 @@
             },
             "ext": "v0"
           },
-          120960
+          3110400
         ]
       ]
     ]
@@ -491,6 +503,9 @@
                 "symbol": "mint"
               },
               {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+              },
+              {
                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
               }
             ],
@@ -561,7 +576,10 @@
           "v0": {
             "topics": [
               {
-                "symbol": "set_admin"
+                "symbol": "admin_proposed"
+              },
+              {
+                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
               }
             ],
             "data": {
