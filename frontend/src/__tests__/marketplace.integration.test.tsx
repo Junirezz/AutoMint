@@ -13,7 +13,7 @@
 
 import React from "react";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
-import type { BotNFT, MarketplaceListing } from "@/types";
+import type { BotNFT, MarketplaceListing, UserProfile } from "@/types";
 
 // ---------------------------------------------------------------------------
 // Mock Zustand wallet store
@@ -91,6 +91,15 @@ jest.mock("@/hooks/useBotDetails", () => ({
   useAllBotDetails: () => ({ data: mockBotDetails.bots }),
 }));
 
+const mockUseProfiles = jest.fn<
+  { data: Record<string, UserProfile | null> | undefined },
+  [string[]]
+>();
+
+jest.mock("@/hooks/useProfiles", () => ({
+  useProfiles: (addresses: string[]) => mockUseProfiles(addresses),
+}));
+
 // ---------------------------------------------------------------------------
 // Mock the modal wrapper so ListBotModal renders inline
 // ---------------------------------------------------------------------------
@@ -120,7 +129,7 @@ const WALLET = "GABC1234TESTWALLETADDRESSXYZ";
 
 const GOLD_BOT: BotNFT = {
   id: 1n,
-  name: "Goldie",
+  nickname: "Goldie",
   owner: WALLET,
   tier: "Gold",
   accrual_rate: 100n,
@@ -130,7 +139,7 @@ const GOLD_BOT: BotNFT = {
 
 const BASIC_BOT: BotNFT = {
   id: 2n,
-  name: "Sparky",
+  nickname: "Sparky",
   owner: "GOTHER99999999999999999999999999",
   tier: "Basic",
   accrual_rate: 1n,
@@ -174,6 +183,33 @@ describe("Marketplace Page Integration (#499)", () => {
     mockMarketplace.myRefetching = false;
     mockBots.botIds = [];
     mockBotDetails.bots = [];
+    mockUseProfiles.mockReturnValue({ data: undefined });
+  });
+
+  it("fetches seller profiles in a single useProfiles batch call and displays usernames", () => {
+    mockMarketplace.allListings = [GOLD_LISTING, BASIC_LISTING];
+    mockBotDetails.bots = [GOLD_BOT, BASIC_BOT];
+    mockUseProfiles.mockReturnValue({
+      data: {
+        [GOLD_LISTING.seller]: {
+          address: GOLD_LISTING.seller,
+          username: "gold_seller",
+          points: 500n,
+        },
+        [BASIC_LISTING.seller]: null,
+      },
+    });
+
+    render(<MarketplacePage />);
+
+    // One batch profile hook call with the unique seller addresses for all rows
+    expect(mockUseProfiles).toHaveBeenCalledWith([
+      GOLD_LISTING.seller,
+      BASIC_LISTING.seller,
+    ]);
+    // Registered seller shows username; unregistered seller falls back to truncated address
+    expect(screen.getByTestId("listing-seller-10")).toHaveTextContent("gold_seller");
+    expect(screen.getByTestId("listing-seller-11")).toHaveTextContent("GOTHER...8888");
   });
 
   it("renders header, tabs, and active listings for a disconnected visitor", () => {
@@ -353,13 +389,15 @@ describe("Marketplace Page Integration (#499)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /List for Sale/i }));
 
-    const title = await screen.findByText(/Sparky for Sale/i);
+    const title = await screen.findByText(/List Sparky Bot for Sale/i);
     expect(title).toBeInTheDocument();
     expect(screen.getByLabelText(/Listing Price/i)).toBeInTheDocument();
 
     // Closing the modal clears the selected bot.
     fireEvent.click(screen.getByRole("button", { name: "Close modal" }));
-    await waitFor(() => expect(screen.queryByText(/Sparky for Sale/i)).not.toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.queryByText(/List Sparky Bot for Sale/i)).not.toBeInTheDocument()
+    );
   });
 
   it("shows the no-owned-bots state when the user has none to list", () => {

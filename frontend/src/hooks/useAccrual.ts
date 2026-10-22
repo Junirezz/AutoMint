@@ -4,6 +4,7 @@ import {
   getAccrualState,
   getAccrualConfig,
   getUserProfile,
+  getUserPoints,
   isRegistered,
   getUserBots,
   getAmtBalance,
@@ -20,6 +21,7 @@ import { pollWhenVisible } from "@/lib/polling";
 import { STALE_TIME, GC_TIME, qk, DASHBOARD_POLL_MS } from "@/lib/queryKeys";
 import { trackStatus, newTxId } from "@/components/ui/TxStatus";
 import { COUNTER_TICK_MS } from "@/lib/constants";
+import { toastContractError } from "@/lib/errors";
 
 const POINTS_PER_HOUR_DIVISOR = 3600; // Seconds in an hour
 
@@ -141,9 +143,6 @@ export function useRegister() {
                   resolve(status);
                   break;
                 case "error":
-                  toast.error(`${label}: ${status.error || "Unknown error"}`, {
-                    id: label,
-                  });
                   reject(new Error(`${label} failed: ${status.error}`));
                   break;
               }
@@ -201,11 +200,18 @@ export function useRegister() {
       queryClient.invalidateQueries({ queryKey: qk.bots(publicKey) });
       queryClient.invalidateQueries({ queryKey: ["botDetails"] });
       queryClient.invalidateQueries({ queryKey: qk.profile(publicKey) });
+      queryClient.invalidateQueries({ queryKey: qk.profilePoints(publicKey) });
       queryClient.invalidateQueries({ queryKey: qk.dashboard(publicKey) });
       toast.success("Registration complete! Welcome to AutoMint!");
     },
     onError: (error: Error) => {
-      // onStatus callbacks already handle error toasts
+      const contract =
+        progress?.step === "mint"
+          ? "botNft"
+          : progress?.step === "accrual"
+            ? "accrual"
+            : "registry";
+      toastContractError(error, contract);
       console.error("Registration failed:", error);
     },
   });
@@ -245,6 +251,23 @@ export function useProfile() {
     gcTime: GC_TIME.STANDARD,
   });
 }
+
+/** Lightweight points projection for dashboard and counter polling. */
+export function useProfilePoints() {
+  const publicKey = useWalletStore(selectPublicKey);
+
+  return useQuery<bigint>({
+    queryKey: qk.profilePoints(publicKey),
+    queryFn: () =>
+      publicKey ? getUserPoints(publicKey) : Promise.resolve(BigInt(0)),
+    enabled: !!publicKey,
+    refetchInterval: pollWhenVisible(),
+    staleTime: STALE_TIME.REALTIME,
+    gcTime: GC_TIME.STANDARD,
+  });
+}
+
+export { useProfiles } from "./useProfiles";
 
 /** Bot IDs owned by the connected wallet address, from the bot_nft contract. */
 export function useBots() {
@@ -339,7 +362,7 @@ export function useUserTotalRate() {
 
 export interface DashboardData {
   registered: boolean;
-  profile: UserProfile | null;
+  profilePoints: bigint | null;
   bots: bigint[];
   accrualState: AccrualState | null;
   amtBalance: bigint;
@@ -364,20 +387,20 @@ export function useDashboardData() {
       if (!publicKey) {
         return {
           registered: false,
-          profile: null,
+          profilePoints: null,
           bots: [],
           accrualState: null,
           amtBalance: BigInt(0),
         };
       }
-      const [registered, profile, bots, accrualState, amtBalance] = await Promise.all([
+      const [registered, profilePoints, bots, accrualState, amtBalance] = await Promise.all([
         isRegistered(publicKey),
-        getUserProfile(publicKey),
+        getUserPoints(publicKey),
         getUserBots(publicKey),
         getAccrualState(publicKey),
         getAmtBalance(publicKey),
       ]);
-      return { registered, profile, bots, accrualState, amtBalance };
+      return { registered, profilePoints, bots, accrualState, amtBalance };
     },
     enabled: !!publicKey,
     refetchInterval: pollWhenVisible(),
@@ -490,11 +513,12 @@ export function useClaim() {
         queryClient.setQueryData(qk.accrualState(publicKey), context.previousAccrual);
         queryClient.setQueryData(qk.dashboard(publicKey), context.previousDashboard);
       }
-      // onStatus callback already handles error toasts
+      toastContractError(error, "accrual");
       console.error("Claim failed:", error);
     },
     onSettled: () => {
       queryClient.invalidateQueries({ queryKey: qk.profile(publicKey) });
+      queryClient.invalidateQueries({ queryKey: qk.profilePoints(publicKey) });
       queryClient.invalidateQueries({ queryKey: qk.accrualState(publicKey) });
       queryClient.invalidateQueries({ queryKey: qk.amtBalance(publicKey) });
       queryClient.invalidateQueries({ queryKey: ["leaderboard"] });
@@ -588,7 +612,7 @@ export function useAnimatedPoints(): AnimatedPoints {
   const [pending, setPending] = useState<bigint>(BigInt(0));
 
   const { data: accrualState } = useAccrualState();
-  const { data: profile } = useProfile();
+  const { data: profilePoints } = useProfilePoints();
   const { data: accrualConfig } = useAccrualConfig();
   // The rate rides along on the accrual state itself (#418), so the
   // interpolation matches the contract's own view in a single call — no
@@ -624,7 +648,7 @@ export function useAnimatedPoints(): AnimatedPoints {
 
   // The headline total uses lifetime_points if available (falling back to profile?.points).
   // progressToNext uses carry_points.
-  const lifetime = accrualState?.lifetime_points ?? profile?.points ?? BigInt(0);
+  const lifetime = accrualState?.lifetime_points ?? profilePoints ?? BigInt(0);
   const progressToNext = accrualState?.carry_points ?? BigInt(0);
   const pointsPerAmt = accrualConfig?.pointsPerAmt;
   const progressToNextRatio =

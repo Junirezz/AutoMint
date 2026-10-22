@@ -50,8 +50,15 @@ import {
   isRegistered,
   getTotalUsers,
   getUserProfile,
+  getUserPoints,
+  getUserBotCount,
+  getUserClaimedAmt,
+  getUsersBatch,
+  MAX_USERS_BATCH,
   getAccrualState,
   getLeaderboard,
+  getLeaderboardForSeason,
+  getSeason,
   getActiveListings,
   getUserListings,
   getUserRank,
@@ -251,6 +258,89 @@ describe("getUserProfile", () => {
   });
 });
 
+describe("scalar registry getters", () => {
+  it("reads scalar fields through their dedicated projection methods", async () => {
+    mockSimulate
+      .mockResolvedValueOnce(350n)
+      .mockResolvedValueOnce(2)
+      .mockResolvedValueOnce(1200n);
+
+    await expect(getUserPoints("GUSER")).resolves.toBe(350n);
+    await expect(getUserBotCount("GUSER")).resolves.toBe(2);
+    await expect(getUserClaimedAmt("GUSER")).resolves.toBe(1200n);
+    expect(mockSimulate.mock.calls.map((call) => call[1])).toEqual([
+      "get_points",
+      "get_bot_count",
+      "get_claimed_amt",
+    ]);
+  });
+
+  it("propagates NotRegistered rather than converting a scalar read to a profile null", async () => {
+    mockSimulate.mockRejectedValue(new Error("NotRegistered"));
+    await expect(getUserPoints("GSTRANGER")).rejects.toThrow("NotRegistered");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getUsersBatch
+// ---------------------------------------------------------------------------
+describe("getUsersBatch", () => {
+  it("returns [] without making an RPC call when addresses is empty", async () => {
+    await expect(getUsersBatch([])).resolves.toEqual([]);
+    expect(mockSimulate).not.toHaveBeenCalled();
+  });
+
+  it("returns 50 slots in order with null for unregistered addresses in a single RPC call", async () => {
+    const addresses = Array.from({ length: MAX_USERS_BATCH }, (_, i) => `GUSER_${i}`);
+    const rawBatch = addresses.map((addr, i) =>
+      i % 2 === 0
+        ? {
+            address: addr,
+            username: `user_${i}`,
+            total_points: BigInt(i * 10),
+            claimed_amt: 0n,
+            registered_at: 1_700_000_000,
+            bot_count: 1,
+          }
+        : null
+    );
+    mockSimulate.mockResolvedValueOnce(rawBatch);
+
+    const result = await getUsersBatch(addresses);
+
+    expect(mockSimulate).toHaveBeenCalledTimes(1);
+    expect(mockSimulate).toHaveBeenCalledWith(
+      expect.any(String),
+      "get_users_batch",
+      expect.any(Array),
+      "GUSER_0"
+    );
+    expect(result).toHaveLength(50);
+    expect(result[0]).toMatchObject({ address: "GUSER_0", username: "user_0", points: 0n });
+    expect(result[1]).toBeNull();
+    expect(result[48]).toMatchObject({ address: "GUSER_48", username: "user_48", points: 480n });
+    expect(result[49]).toBeNull();
+  });
+
+  it("throws when more than MAX_USERS_BATCH (50) addresses are passed", async () => {
+    const tooMany = Array.from({ length: MAX_USERS_BATCH + 1 }, (_, i) => `GUSER_${i}`);
+    await expect(getUsersBatch(tooMany)).rejects.toThrow(/at most 50 addresses/);
+    expect(mockSimulate).not.toHaveBeenCalled();
+  });
+
+  it("throws when the contract returns a non-array", async () => {
+    mockSimulate.mockResolvedValueOnce(null);
+    await expect(getUsersBatch(["GUSER"])).rejects.toThrow(
+      "get_users_batch returned unexpected type"
+    );
+  });
+
+  it("propagates RPC/contract simulation errors", async () => {
+    mockSimulate.mockRejectedValueOnce(new Error("rpc down"));
+    await expect(getUsersBatch(["GUSER"])).rejects.toThrow("rpc down");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // getAccrualState
 // ---------------------------------------------------------------------------
@@ -352,6 +442,82 @@ describe("getLeaderboard", () => {
   it("returns an empty array when the contract genuinely returns []", async () => {
     mockSimulate.mockResolvedValue([]);
     await expect(getLeaderboard(10, "GSRC")).resolves.toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getSeason (#371)
+// ---------------------------------------------------------------------------
+describe("getSeason", () => {
+  it("returns the current season number", async () => {
+    mockSimulate.mockResolvedValue(3);
+    await expect(getSeason("GSRC")).resolves.toBe(3);
+    expect(mockSimulate).toHaveBeenCalledWith(
+      expect.any(String),
+      "get_season",
+      [],
+      "GSRC"
+    );
+  });
+
+  it("coerces the scVal result to a JS number", async () => {
+    mockSimulate.mockResolvedValue(0);
+    await expect(getSeason("GSRC")).resolves.toBe(0);
+  });
+
+  it("throws on RPC failure", async () => {
+    mockSimulate.mockRejectedValue(new Error("boom"));
+    await expect(getSeason("GSRC")).rejects.toThrow("boom");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getLeaderboardForSeason (#371)
+// ---------------------------------------------------------------------------
+describe("getLeaderboardForSeason", () => {
+  it("maps season rows onto the table's profile shape", async () => {
+    mockSimulate.mockResolvedValue([
+      {
+        address: "GADA",
+        display_name: "Ada",
+        season_points: "70",
+        total_points: "120",
+      },
+    ]);
+    const rows = await getLeaderboardForSeason(4, 10, "GSRC");
+    expect(mockSimulate).toHaveBeenCalledWith(
+      expect.any(String),
+      "get_leaderboard_for_season",
+      expect.any(Array),
+      "GSRC"
+    );
+    expect(rows).toEqual([
+      {
+        address: "GADA",
+        username: "Ada",
+        display_name: "Ada",
+        total_points: 120n,
+        points: 70n,
+        claimed_amt: 0n,
+        claimedAmt: 0n,
+        registered_at: 0,
+        registeredAt: 0,
+        bot_count: 0,
+        botCount: 0,
+      },
+    ]);
+  });
+
+  it("rejects a non-array payload — schema mismatch, not empty list", async () => {
+    mockSimulate.mockResolvedValue({ nope: true });
+    await expect(getLeaderboardForSeason(1, 50, "GSRC")).rejects.toThrow(
+      "get_leaderboard_for_season returned unexpected type"
+    );
+  });
+
+  it("throws on RPC failure", async () => {
+    mockSimulate.mockRejectedValue(new Error("boom"));
+    await expect(getLeaderboardForSeason(1, 50, "GSRC")).rejects.toThrow("boom");
   });
 });
 
@@ -523,6 +689,48 @@ describe("getUserRank", () => {
       rank: null,
       points: 42n,
     });
+  });
+
+  it("recognizes Soroban's missing-contract-function error for older registries", async () => {
+    mockSimulate
+      .mockResolvedValueOnce(board)
+      .mockRejectedValueOnce(new Error("Simulation failed for get_rank: Error(Contract, #0)"))
+      .mockResolvedValueOnce({ address: "GD", username: "D", total_points: 42n });
+
+    await expect(getUserRank("GD", "GSRC")).resolves.toMatchObject({
+      rank: null,
+      points: 42n,
+    });
+  });
+
+  it("propagates unexpected get_rank simulation failures", async () => {
+    const rpcError = new Error("RPC unavailable");
+    mockSimulate
+      .mockResolvedValueOnce(board)
+      .mockRejectedValueOnce(rpcError)
+      .mockResolvedValueOnce({ address: "GD", username: "D", total_points: 42n });
+
+    await expect(getUserRank("GD", "GSRC")).rejects.toBe(rpcError);
+  });
+
+  it("propagates unexpected get_rank contract errors", async () => {
+    const contractError = new Error("Simulation failed for get_rank: Error(Contract, #5)");
+    mockSimulate
+      .mockResolvedValueOnce(board)
+      .mockRejectedValueOnce(contractError)
+      .mockResolvedValueOnce({ address: "GD", username: "D", total_points: 42n });
+
+    await expect(getUserRank("GD", "GSRC")).rejects.toBe(contractError);
+  });
+
+  it("propagates profile lookup failures after the missing-method fallback", async () => {
+    const rpcError = new Error("RPC unavailable");
+    mockSimulate
+      .mockResolvedValueOnce(board)
+      .mockRejectedValueOnce(new Error("unknown function get_rank"))
+      .mockRejectedValueOnce(rpcError);
+
+    await expect(getUserRank("GD", "GSRC")).rejects.toBe(rpcError);
   });
 
   it("resolves to null when the address has no registry profile", async () => {
@@ -759,10 +967,11 @@ describe("getAmtDecimals (#479)", () => {
 // ---------------------------------------------------------------------------
 describe("parse helpers in contracts.ts", () => {
   describe("parseUserProfile", () => {
-    it("should parse raw user profile data correctly with all six fields", () => {
+    it("should parse raw user profile data correctly with all seven fields", () => {
       const rawData = {
         address: "GALICE",
         username: "alice",
+        display_name: "Alice",
         total_points: "150",
         claimed_amt: "10",
         registered_at: 1700000000,
@@ -774,6 +983,7 @@ describe("parse helpers in contracts.ts", () => {
       expect(result).toEqual({
         address: "GALICE",
         username: "alice",
+        display_name: "Alice",
         total_points: 150n,
         points: 150n,
         claimed_amt: 10n,
@@ -783,6 +993,18 @@ describe("parse helpers in contracts.ts", () => {
         bot_count: 2,
         botCount: 2,
       });
+    });
+
+    it("falls back to the normalized username when display_name is absent (#373)", () => {
+      const parsed = parseUserProfile({
+        address: "GALICE",
+        username: "alice",
+        total_points: 0,
+        claimed_amt: 0,
+        registered_at: 0,
+        bot_count: 0,
+      });
+      expect(parsed.display_name).toBe("alice");
     });
 
     it("parses correctly with bigint total_points", () => {
@@ -901,7 +1123,7 @@ describe("parse helpers in contracts.ts", () => {
     it("should parse raw bot NFT data correctly with string tier", () => {
       const rawData = {
         id: 10,
-        name: "Bot #10",
+        nickname: "Bot #10",
         owner: "GXYZ987654321",
         tier: "Gold",
         accrual_rate: "50",
@@ -913,7 +1135,7 @@ describe("parse helpers in contracts.ts", () => {
 
       expect(result).toEqual({
         id: 10n,
-        name: "Bot #10",
+        nickname: "Bot #10",
         owner: "GXYZ987654321",
         tier: "Gold",
         accrual_rate: 50n,

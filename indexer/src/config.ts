@@ -11,6 +11,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { CONTRACT_NAMES, type ContractConfig, type ContractName } from "./types.js";
 
 export const DEFAULT_NETWORK = process.env.AM_NETWORK ?? "testnet";
@@ -24,8 +25,9 @@ export const CONTRACT_ENV_VARS: Record<ContractName, string[]> = {
 };
 
 function repoRoot(): string {
-  // indexer/src/config.ts → indexer → repo root (works for dist/config.js too)
-  return path.resolve(path.dirname(new URL(import.meta.url).pathname), "..", "..");
+  // indexer/src/config.ts → indexer → repo root (works for dist/config.js too).
+  // fileURLToPath decodes %20 and yields a native C:\ path on Windows (#1234).
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 }
 
 /** Normalize a raw contract address (trim, uppercase C/G prefix). */
@@ -80,8 +82,10 @@ export function loadContractConfig(network = DEFAULT_NETWORK): LoadedConfig {
   if (fs.existsSync(manifestPath)) {
     try {
       manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-    } catch {
-      manifest = {};
+    } catch (err) {
+      throw new Error(
+        `Failed to parse deployment manifest at ${manifestPath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
@@ -135,6 +139,24 @@ export function assertCompleteConfig(
       `Missing contract IDs for: ${loaded.missing.join(", ")}. ` +
         `Run ./scripts/deploy.sh ${loaded.config.network} first, or set the ` +
         `AM_*_CONTRACT_ID env vars.`,
+    );
+  }
+
+  // Every resolved ID feeds the RPC `getEvents` filters, so a malformed or
+  // placeholder value must stop startup here rather than fail on every poll (#659, #1230).
+  const invalid = CONTRACT_NAMES.filter(
+    (name) => !isContractAddress(loaded.config.contracts[name]),
+  );
+  if (invalid.length > 0) {
+    const details = invalid
+      .map(
+        (name) =>
+          `${name} ("${loaded.config.contracts[name]}", from ${loaded.sources[name]})`,
+      )
+      .join(", ");
+    throw new Error(
+      `Invalid contract IDs for: ${details}. Each ID must be a Soroban ` +
+        `contract address (C followed by 55 base32 characters).`,
     );
   }
 }
